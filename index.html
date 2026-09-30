@@ -221,26 +221,31 @@ const Engine = (() => {
     return cleanVendor(d);
   }
 
-  function loadFeed(csvText, account) {
+  function loadFeed(csvText, account, forced) {
     const recs = parseCSV(csvText);
+    const pick = (r, ...names) => { for (const n of names) { const k = Object.keys(r).find(h => h.toLowerCase() === n); if (k && r[k] !== '') return r[k]; } return ''; };
     return recs.map((r, i) => {
-      const spent = money(r.SPENT), rec = money(r.RECEIVED);
-      const suggested = r['Categorize or match'] || '';
+      let spent = money(pick(r, 'spent', 'payment', 'debit', 'withdrawal')), rec = money(pick(r, 'received', 'deposit', 'credit'));
+      const amt = pick(r, 'amount');
+      if (!spent && !rec && amt) { const a = money(amt); if (a < 0) spent = -a; else rec = a; }
+      const desc = pick(r, 'description', 'memo', 'name');
+      const payee = pick(r, 'payee', 'vendor');
+      const dateRaw = pick(r, 'date');
       return {
         id: 't' + i,
-        date: isoDate(r.Date || ''),
-        desc: r.DESCRIPTION || r.Description || '',
-        payee: r.Payee || '',
-        vendor: extractVendor(r.DESCRIPTION || r.Description, r.Payee),
-        amount: rec - spent,
-        suggestedGL: suggested,
-        suggestedClass: r.Class || '',
-        accountNum: account.num,
-        accountName: account.name
+        dateRaw, date: isoDate(dateRaw),
+        desc, payee, vendor: extractVendor(desc, payee),
+        amount: Math.round((rec - spent) * 100) / 100,
+        suggestedGL: pick(r, 'categorize or match', 'category'),
+        suggestedClass: pick(r, 'class'),
+        force: !!(forced && forced.has('t' + i)),
+        accountNum: account.num, accountName: account.name
       };
-    });
+    }).filter(t => t.desc || t.payee || t.amount);
   }
 
+  // whole-word match so "Nolan" is not NOLA and "Transferwise" is not a transfer
+  const hasWord = (text, w) => new RegExp('(^|[^a-z])' + w + 's?([^a-z]|$)', 'i').test(text);
   const wordHit = (text, word) => new RegExp('(^|[^a-z])' + word + '([^a-z]|$)', 'i').test(text);
 
   function classFromKeywords(desc) {
@@ -250,135 +255,138 @@ const Engine = (() => {
     return null;
   }
 
+  const US_PAYROLL_CLASSES = ['chicago', 'nyc', 'sia', 'washington dc'];
+  const isReserved = c => RESERVED_CLASSES.map(x => x.toLowerCase()).includes(String(c || '').trim().toLowerCase());
+  const glNumber = gl => { const m = String(gl || '').match(/^\s*(\d+)/); return m ? parseInt(m[1], 10) : null; };
+
   function classifyOne(tx, cfg, account) {
     const trace = [];
-    const out = { lane: 'new', gl: '', cls: '', source: '', vendorKnown: false, adminReview: false, reason: '', trace, note: '' };
+    const out = { lane: 'new', gl: '', cls: '', source: '', vendorKnown: false, adminReview: false, reason: '', trace, exKind: '', billStatus: '' };
     const vkey = vendorKey(tx.vendor);
     const descL = tx.desc.toLowerCase();
 
-    // Out of scope: journal-entry-driven items (SOP section 1)
-    const gl = tx.suggestedGL || '';
-    const glNum = (gl.match(/^\d+/) || [''])[0];
-    const kw = SCOPE_KEYWORDS.find(k => descL.includes(k) || vkey.includes(k));
-    if (glNum.startsWith('3') || glNum === '10031' || kw) {
-      out.lane = 'scope';
-      out.reason = glNum.startsWith('3') ? 'Equity / distribution item, posted by journal entry'
-        : glNum === '10031' ? 'Sales clearing item (Xola / Viator), posted by journal entry'
-        : `Matches "${kw}", posted by journal entry`;
-      trace.push('Out of scope: journal-entry-driven items never enter the import file.');
-      return out;
+    // Section 1: journal-entry-driven items are never part of this pipeline
+    if (!tx.force) {
+      const gl = tx.suggestedGL || '';
+      const g = glNumber(gl);
+      const kw = SCOPE_KEYWORDS.find(k => hasWord(descL, k) || hasWord(vkey, k));
+      const eq = g !== null && g >= 30000 && g < 40000;
+      if (eq || g === 10031 || kw) {
+        out.lane = 'scope';
+        out.reason = eq ? 'Equity / distribution item. Posted by journal entry, never by this import.'
+          : g === 10031 ? 'Sales clearing item (Xola / Viator). Posted by journal entry, never by this import.'
+          : `Matches "${kw}". Posted by journal entry, never by this import.`;
+        trace.push('Out of scope (SOP section 1): Xola, Viator, payroll, distributions and transfers follow their own JE process.');
+        return out;
+      }
     }
 
-    // Step 2: open bill check
+    // Step 2: open bill check, before any categorisation
     if (tx.amount < 0) {
       const bills = cfg.openBills.filter(b => vendorKey(b.vendor) === vkey);
       const hit = bills.find(b => Math.abs(Math.abs(b.amount) - Math.abs(tx.amount)) < 0.005);
-      const vm = cfg.vendorMaster.find(v => vendorKey(v.vendor) === vkey);
+      const vmAny = cfg.vendorMaster.find(v => vendorKey(v.vendor) === vkey);
       if (hit) {
         out.lane = 'bill'; out.billStatus = 'match';
-        out.reason = `Matches open bill of ${Math.abs(hit.amount).toFixed(2)}${hit.date ? ' dated ' + hit.date : ''}. Confirm with Pay Bills / Match in QBO.`;
-        trace.push('Open bill found with the same amount: routed to Bill Payments List.');
+        out.reason = `Matches an open bill of ${Math.abs(hit.amount).toFixed(2)}${hit.date ? ' dated ' + hit.date : ''}. Confirm with Pay Bills / Match in QBO.`;
+        trace.push('Step 2: open bill found for this vendor and amount. Routed to the Bill Payments List, not categorised.');
         return out;
       }
       if (bills.length) {
         out.lane = 'bill'; out.billStatus = 'amount';
-        out.reason = `Vendor has ${bills.length} open bill(s) but none for this amount. Check for a part-payment before matching.`;
-        trace.push('Vendor has open bills, amount differs: routed to Bill Payments List for a person to match.');
+        out.reason = `Vendor has ${bills.length} open bill(s), none for this amount. A person checks for a part-payment before matching.`;
+        trace.push('Step 2: vendor has open bills but the amount differs. Routed to the Bill Payments List.');
         return out;
       }
-      if (vm && vm.billOnly) {
+      if (vmAny && vmAny.billOnly) {
         out.lane = 'bill'; out.billStatus = 'nobill';
-        out.reason = 'Bill-payment-only vendor with no open bill on file. Enter the bill first, then Pay Bills / Match.' + (vm.note ? ' ' + vm.note : '');
-        trace.push('Vendor is bill-payment-only (SOP 13.1). Never categorised as an expense.');
+        out.reason = 'Bill-payment-only vendor with no open bill on file. Enter the bill first, then Pay Bills / Match.' + (vmAny.note ? ' ' + vmAny.note : '');
+        trace.push('Step 2: bill-payment-only vendor (SOP 13.1). Never categorised as a standalone expense.');
         return out;
       }
-      trace.push('No open bill for this vendor: continue to categorisation.');
+      trace.push('Step 2: no open bill for this vendor. Continue to categorisation.');
     }
 
     if (!tx.vendor) {
-      out.lane = 'exception';
-      out.reason = 'No vendor could be identified. Held in the exception queue, never posted under a placeholder.';
-      trace.push('No vendor identifiable.');
+      out.lane = 'exception'; out.exKind = 'novendor';
+      out.reason = 'No vendor could be identified. Held in the Exception Queue, never posted under a placeholder.';
+      trace.push('No vendor identifiable (SOP 6.1).');
       return out;
     }
 
-    // Email rules log, latest first
     const emails = cfg.emailRules.filter(e => vendorKey(e.vendor) === vkey).sort((a, b) => (b.date || '').localeCompare(a.date || ''));
     const email = emails[0];
 
     // Step 1b: personal-book keywords
-    const pk = PERSONAL_KEYWORDS.find(k => descL.includes(k));
-    if (pk && !email) {
-      out.lane = 'exception';
-      out.reason = `Description contains "${pk}". Possibly Steven Garcia's personal book. SOP 4.1 Step 1b is unconfirmed, so no rule is built. Held for Dhwani / Jonathan.`;
-      trace.push('Step 1b personal-book keyword hit: routed to Exception Queue.');
+    const pk = PERSONAL_KEYWORDS.find(k => hasWord(descL, k));
+    if (pk && !(email && email.cls)) {
+      out.lane = 'exception'; out.exKind = 'personal';
+      out.reason = `Description contains "${pk}". This may belong to Steven Garcia's personal book. SOP 4.1 Step 1b is unconfirmed, so no rule is built and the row is held for the Reviewer and Jonathan.`;
+      trace.push('Step 1b: personal-book keyword. Routed to the Exception Queue.');
       return out;
     }
 
-    // Accounts: bank rule -> vendor master -> email log
+    // Steps 3-5 of the daily procedure: bank rules, Vendor Master, Jonathan email log
     const cands = [];
     const rules = cfg.bankRules.filter(r => r.contains && descL.includes(r.contains.toLowerCase()));
     const exactRule = rules.find(r => r.vendor && vendorKey(r.vendor) === vkey);
-    if (exactRule) { cands.push({ src: 'Bank rule', gl: exactRule.gl, cls: exactRule.cls }); trace.push(`Bank rule "${exactRule.contains}" fired with matching vendor.`); }
-    const fuzzy = !exactRule && rules[0];
+    if (exactRule) { cands.push({ src: 'Bank rule', gl: exactRule.gl, cls: exactRule.cls }); trace.push(`Step 3: bank rule "${exactRule.contains}" fired on vendor and description.`); }
     const vm = cfg.vendorMaster.find(v => vendorKey(v.vendor) === vkey && !v.billOnly);
-    if (vm && vm.gl) { cands.push({ src: 'Vendor Master', gl: vm.gl, cls: vm.cls }); trace.push('Exact vendor match in Vendor Master.'); }
-    if (email) { cands.push({ src: 'Email rule', gl: email.gl, cls: email.cls, date: email.date }); trace.push(`Jonathan email rule${email.date ? ' (' + email.date + ')' : ''} found.`); }
+    if (vm && vm.gl) { cands.push({ src: 'Vendor Master', gl: vm.gl, cls: vm.cls }); trace.push('Step 4: exact vendor match in the Vendor Master.'); }
+    if (email && email.gl) { cands.push({ src: 'Email rule', gl: email.gl, cls: email.cls }); trace.push(`Step 5: Jonathan email rule${email.date ? ' dated ' + email.date : ''}.`); }
 
-    if (fuzzy) {
-      out.lane = 'new'; out.reason = `Bank rule "${fuzzy.contains}" matched the description only, not the vendor. Possible keyword misfire.`;
-      trace.push('Fuzzy bank rule match: held.');
-      return finishNew(out, tx);
-    }
-    if (!cands.length) {
-      out.reason = 'New vendor. Not found in bank rules, Vendor Master or the email log.';
-      trace.push('Vendor not found in any source of truth.');
-      return finishNew(out, tx);
-    }
-
-    // Conflicts between sources
-    const gls = [...new Set(cands.map(c => c.gl).filter(Boolean))];
-    const clss = [...new Set(cands.map(c => c.cls).filter(Boolean))];
-    out.vendorKnown = true;
-    if (gls.length > 1 || clss.length > 1) {
-      out.lane = 'new';
-      out.reason = 'Sources disagree (' + cands.map(c => `${c.src}: ${c.gl || '-'} / ${c.cls || '-'}`).join('; ') + '). The most recent Jonathan email wins; a person confirms.';
-      const pick = email || cands[0];
-      out.gl = pick.gl || ''; out.cls = pick.cls || ''; out.source = pick.src;
-      trace.push('Conflict between sources.');
+    const misfire = !exactRule && rules[0];
+    if (misfire) {
+      out.reason = `Bank rule "${misfire.contains}" matched the description only, not the vendor. Possible keyword misfire, held for a person.`;
+      trace.push('Fuzzy bank-rule match. Held (SOP section 5).');
       return out;
     }
-    out.gl = gls[0] || ''; out.source = cands.map(c => c.src).join(' + ');
-    if (!out.gl) { out.reason = 'A source matched but gave no account.'; return out; }
-
-    // Class waterfall (SOP 4.1)
-    if (email && email.cls) { out.cls = email.cls; trace.push('Class from Jonathan email (Step 1).'); }
-    else {
-      const given = clss[0];
-      if (given) { out.cls = given; trace.push('Class from matched source.'); }
-      else if (account.bankClass) { out.cls = account.bankClass; trace.push(`Class from bank account: ${account.name} gives ${account.bankClass} (Step 2).`); }
-      else if (/payroll|wages|salary/i.test(out.gl)) {
-        out.lane = 'new'; out.reason = 'Payroll entry with no class. Confirm against Louise Petrie payroll Excel (Step 3). Never guessed.';
-        trace.push('Payroll class must be verified: held.');
-        return out;
-      } else {
-        const k = classFromKeywords(tx.desc);
-        if (k) { out.cls = k.cls; trace.push(`Class ${k.cls}: ${k.why} (Step 4).`); }
-        else { out.cls = 'Administrative'; out.adminReview = true; trace.push('No step resolved the class: Administrative for now, added to Admin Class Review List (Step 5).'); }
-      }
+    if (!cands.length) {
+      out.reason = 'New vendor. Not found in any bank rule, the Vendor Master or the email log.';
+      trace.push('Vendor not found in any of the three sources of truth.');
+      return out;
     }
-    if (RESERVED_CLASSES.map(x => x.toLowerCase()).includes(out.cls.toLowerCase())) {
-      out.lane = 'exception'; out.reason = `Class "${out.cls}" is reserved for Steven Garcia's personal book or not allowed in Empire.`;
+
+    out.vendorKnown = true;
+    const gls = [...new Set(cands.map(c => c.gl).filter(Boolean))];
+    const clss = [...new Set(cands.map(c => c.cls).filter(Boolean))];
+    if (gls.length > 1 || clss.length > 1) {
+      const pick = cands.find(c => c.src === 'Email rule') || cands[0];
+      out.gl = pick.gl || ''; out.cls = pick.cls || ''; out.source = pick.src;
+      out.reason = 'Sources disagree (' + cands.map(c => `${c.src}: ${c.gl || '-'} / ${c.cls || '-'}`).join('; ') + '). The most recent Jonathan email wins. A person confirms and the Reviewer fixes the stale source.';
+      trace.push('Conflict between sources (SOP section 5). Held.');
+      return out;
+    }
+    out.gl = gls[0]; out.source = cands.map(c => c.src).join(' + ');
+
+    // Section 4.1 class waterfall, stopping at the first confident answer
+    let clsFromEmail = false;
+    if (email && email.cls) { out.cls = email.cls; clsFromEmail = true; trace.push('Class Step 1: class given in Jonathan email log.'); }
+    else if (clss[0]) { out.cls = clss[0]; trace.push('Class Step 1: class held by the matched rule / Vendor Master entry.'); }
+    else if (account.bankClass) { out.cls = account.bankClass; trace.push(`Class Step 2: bank account ${account.name} maps to ${account.bankClass}.`); }
+    else {
+      const k = classFromKeywords(tx.desc);
+      if (k) { out.cls = k.cls; trace.push(`Class Step 4: ${k.why}.`); }
+      else if (vm && vm.multiLocation) {
+        out.reason = 'Vendor is used across more than one Empire location and neither the bank account nor the description gives the class. A person decides.';
+        trace.push('Multi-location vendor, class unresolved (SOP section 5). Held.');
+        return out;
+      } else { out.cls = 'Administrative'; out.adminReview = true; trace.push('Class Step 5: nothing resolved the class. Administrative for now, added to the Administrative Class Review List.'); }
+    }
+
+    if (isReserved(out.cls)) {
+      out.lane = 'exception'; out.exKind = 'reserved';
+      out.reason = `Class "${out.cls}" is reserved for Steven Garcia's personal book or not allowed in Empire.`;
+      return out;
+    }
+    // Class Step 3: non-US payroll classes are never guessed
+    if (/payroll/i.test(out.gl) && !clsFromEmail && !US_PAYROLL_CLASSES.includes(out.cls.toLowerCase())) {
+      out.reason = `Payroll entry with class "${out.cls}". Confirm the class against Louise Petrie's payroll email / Excel before posting.`;
+      trace.push('Class Step 3: non-US payroll class must be verified. Held.');
       return out;
     }
     out.lane = 'old';
     out.reason = 'Matched with full confidence.';
-    return out;
-  }
-
-  // Pre-fill a proposed class for New rows so the person only confirms or corrects.
-  function finishNew(out, tx) {
-    out.gl = ''; out.cls = '';
     return out;
   }
 
@@ -397,57 +405,84 @@ const Engine = (() => {
     });
   }
 
-  function isResolvedNew(r) { return r.resolved && r.resolved.confirmed; }
+  const isResolvedNew = r => !!(r.resolved && r.resolved.confirmed);
+  const canConfirm = r => r.lane === 'new' || (r.lane === 'exception' && r.exKind === 'novendor');
 
-  // Rows that will enter the import file
+  // Rows that enter the SaasAnt file: Old matches plus Team-Member-confirmed New rows
   function importRows(results) {
-    return results.filter(r => r.lane !== 'bill' && r.lane !== 'scope' && (r.lane === 'old' || isResolvedNew(r)))
+    return results.filter(r => r.lane === 'old' || (canConfirm(r) && isResolvedNew(r)))
       .map(r => {
         const conf = isResolvedNew(r);
         const f = conf ? r.resolved : { vendor: r.vendor, gl: r.gl, cls: r.cls };
-        return { id: r.id, date: r.date, desc: r.desc, vendor: f.vendor || r.vendor, gl: f.gl, cls: f.cls, amount: r.amount, memo: conf ? 'Confirmed by ' + (r.resolved.by || 'team member') : 'Auto: ' + r.source, adminReview: conf ? f.cls === 'Administrative' : r.adminReview };
+        return { id: r.id, date: r.date, dateRaw: r.dateRaw, desc: r.desc, vendor: f.vendor || r.vendor, gl: f.gl, cls: f.cls, amount: r.amount,
+          memo: conf ? 'Confirmed by ' + (r.resolved.by || 'team member') : 'Auto: ' + r.source,
+          adminReview: conf ? f.cls === 'Administrative' : r.adminReview };
       });
   }
 
-  // Section 8 automated checks
-  function checks(rows, results) {
+  // Section 8 automated review checks
+  function checks(rows) {
     const flags = [];
+    const isPL = r => { const g = glNumber(r.gl); return g !== null && g >= 40000; };
+
+    // Duplicate postings: date, vendor, description, amount and account
     const groups = {};
-    rows.forEach(r => { const k = [r.date, vendorKey(r.vendor), r.desc.toLowerCase(), r.amount.toFixed(2)].join('|'); (groups[k] = groups[k] || []).push(r); });
+    rows.forEach(r => { const k = [r.date, vendorKey(r.vendor), r.desc.toLowerCase(), r.amount.toFixed(2), r.gl].join('|'); (groups[k] = groups[k] || []).push(r); });
     Object.values(groups).filter(g => g.length > 1).forEach(g => flags.push({
-      id: 'dup:' + g[0].id, kind: 'Possible duplicate', severity: 'warn',
-      title: `${g.length} identical rows: ${g[0].vendor}, ${g[0].date}, ${g[0].amount.toFixed(2)}`,
+      id: 'dup:' + g[0].id, kind: 'Possible duplicate posting', severity: 'warn',
+      title: `${g.length} identical rows: ${g[0].vendor}, ${g[0].dateRaw}, ${g[0].amount.toFixed(2)}`,
       detail: 'Same date, vendor, description, amount and account. Verify against the source statement.'
     }));
+
+    const pl = rows.filter(isPL);
+    // Vendor to top-account consistency (P&L accounts only)
     const byVendor = {};
-    rows.forEach(r => { (byVendor[vendorKey(r.vendor)] = byVendor[vendorKey(r.vendor)] || []).push(r); });
+    pl.forEach(r => { (byVendor[vendorKey(r.vendor)] = byVendor[vendorKey(r.vendor)] || []).push(r); });
     Object.entries(byVendor).forEach(([k, g]) => {
       if (g.length < 2) return;
       const cnt = {}; g.forEach(r => cnt[r.gl] = (cnt[r.gl] || 0) + 1);
       const [topGl, topN] = Object.entries(cnt).sort((a, b) => b[1] - a[1])[0];
       const pct = topN / g.length * 100;
-      if (pct < 85) flags.push({ id: 'cons:' + k, kind: 'Account consistency', severity: 'warn', title: `${g[0].vendor}: ${pct.toFixed(0)}% on ${topGl}`, detail: `${g.length} rows across ${Object.keys(cnt).length} accounts. Below 85%: decide if this is a genuine business vendor or an individual with mixed expenses.` });
+      if (pct < 85) flags.push({ id: 'cons:' + k, kind: 'Account consistency', severity: 'warn', title: `${g[0].vendor}: ${pct.toFixed(0)}% on ${topGl}`, detail: `${g.length} rows across ${Object.keys(cnt).length} accounts in this batch, below the 85% line. Judge whether this is a genuine business vendor or an individual with mixed expenses.` });
     });
+
+    // Description drift: the same recurring charge hitting different accounts
+    const drift = {};
+    pl.forEach(r => { const k = vendorKey(r.vendor) + '|' + r.desc.toLowerCase().replace(/ref:.*$/, '').replace(/[0-9]+/g, '#').trim(); (drift[k] = drift[k] || []).push(r); });
+    Object.entries(drift).forEach(([k, g]) => {
+      const set = [...new Set(g.map(r => r.gl))];
+      if (g.length > 1 && set.length > 1) flags.push({ id: 'drift:' + k, kind: 'Description drift', severity: 'warn', title: `${g[0].vendor}: same description on ${set.length} accounts`, detail: set.join(' / ') + '. A recurring charge may have started hitting a different account partway through.' });
+    });
+
+    // Duplicate vendor records: same vendor, different spelling (the _G / _E suffixes are already merged)
+    const names = [...new Set(rows.map(r => vendorKey(r.vendor)).filter(Boolean))];
+    const tok = n => n.split(' ').filter(Boolean);
+    for (let i = 0; i < names.length; i++) for (let j = i + 1; j < names.length; j++) {
+      const a = tok(names[i]), b = tok(names[j]);
+      const same = a.length > 1 && b.length > 1 && a[0] === b[0] && a[a.length - 1] === b[b.length - 1];
+      const squash = names[i].replace(/[^a-z0-9]/g, '') === names[j].replace(/[^a-z0-9]/g, '');
+      if (same || squash) flags.push({ id: 'vdup:' + names[i] + '|' + names[j], kind: 'Possible duplicate vendor', severity: 'warn', title: `"${names[i]}" and "${names[j]}"`, detail: 'Looks like one vendor under two spellings. Check the date ranges for overlap versus a clean cutover before merging.' });
+    }
+
     rows.forEach(r => {
-      if (!r.vendor) flags.push({ id: 'nov:' + r.id, kind: 'Missing vendor', severity: 'crit', title: `No vendor on ${r.date} ${r.desc}`, detail: 'Nothing is posted without a vendor.' });
+      if (!r.vendor) flags.push({ id: 'nov:' + r.id, kind: 'Missing vendor', severity: 'crit', title: `No vendor on ${r.dateRaw} ${r.desc}`, detail: 'Nothing is posted without a vendor.' });
       if (!r.gl) flags.push({ id: 'nogl:' + r.id, kind: 'Missing account', severity: 'crit', title: `No account for ${r.vendor}`, detail: 'Every row needs a GL account.' });
-      if (RESERVED_CLASSES.map(x => x.toLowerCase()).includes((r.cls || '').toLowerCase()) || !r.cls) flags.push({ id: 'cls:' + r.id, kind: 'Invalid class', severity: 'crit', title: `${r.vendor}: class "${r.cls || 'none'}"`, detail: 'Reserved or empty classes cannot be used in Empire.' });
+      if (!r.cls || isReserved(r.cls)) flags.push({ id: 'cls:' + r.id, kind: 'Invalid class', severity: 'crit', title: `${r.vendor}: class "${r.cls || 'none'}"`, detail: 'Reserved or empty classes cannot be used in Empire.' });
     });
     return flags;
   }
 
   function saasantCSV(rows) {
     const head = ['Date', 'Description/Name', 'Vendor', 'Account', 'Class', 'Amount', 'Memo'];
-    return toCSV([head].concat(rows.map(r => [r.date, r.desc, r.vendor, r.gl, r.cls, r.amount.toFixed(2), r.memo])));
+    return toCSV([head].concat(rows.map(r => [r.dateRaw, r.desc, r.vendor, r.gl, r.cls, r.amount.toFixed(2), r.memo])));
   }
 
-  return { parseCSV, toCSV, loadFeed, run, importRows, checks, saasantCSV, vendorKey, cleanVendor, money, RESERVED_CLASSES };
+  return { parseCSV, toCSV, loadFeed, run, importRows, checks, saasantCSV, vendorKey, cleanVendor, money, isReserved, canConfirm, RESERVED_CLASSES };
 })();
 if (typeof module !== 'undefined') module.exports = Engine;
 
 </script>
 <script>
-const SAMPLE_CSV = "Date,DESCRIPTION,Payee,Categorize or match,Class,SPENT,RECEIVED\r\n\"09/27/2026\",\"National\",\"National Indemnity Co\",\"30040 Shareholders' equity:Distributions\",\"\",\"£801.09\",\"\"\r\n\"09/22/2026\",\"Paid to STRIPE RE DEEL\",\"\",\"50005 Cost of Goods Sold:Contract labor\",\"\",\"£7.63\",\"\"\r\n\"09/10/2026\",\"Received Money Owl Ref:1849696\",\"\",\"30040 Shareholders' equity:Distributions\",\"\",\"\",\"£451.00\"\r\n\"09/29/2026\",\"Received Money Xola\",\"Xola_G\",\"10031 Sales Clearing Account:XOLA Sales\",\"Empire Tours:London\",\"\",\"£76.57\"\r\n\"09/27/2026\",\"Sent money to Miss Jennifer Petrie\",\"Jennifer Petrie\",\"50005 Cost of Goods Sold:Contract labor\",\"\",\"£3,646.96\",\"\"\r\n\"09/27/2026\",\"Sent money to Miss Louise Petrie\",\"Louise Petrie\",\"50005 Cost of Goods Sold:Contract labor\",\"\",\"£3,811.21\",\"\"\r\n\"08/20/2026\",\"Sent money to Yassine Achebarrou\",\"\",\"50005 Cost of Goods Sold:Contract labor\",\"\",\"£414.00\",\"\"\r\n\"09/25/2026\",\"Sent money to Yassine Achebarrou\",\"\",\"50005 Cost of Goods Sold:Contract labor\",\"\",\"£138.00\",\"\"\r\n\"09/27/2026\",\"Sent money to Yassine Achebarrou\",\"\",\"50005 Cost of Goods Sold:Contract labor\",\"\",\"£2,693.50\",\"\"\r\n\"08/06/2026\",\"Sent Money Yassine\",\"Yassine Achebarrou_G\",\"50005 Cost of Goods Sold:Contract labor\",\"\",\"£299.00\",\"\"\r\n\"08/13/2026\",\"Sent Money Yassine\",\"Yassine Achebarrou_G\",\"50005 Cost of Goods Sold:Contract labor\",\"\",\"£345.00\",\"\"\r\n\"08/14/2026\",\"Sent Money Yassine\",\"Yassine Achebarrou_G\",\"50005 Cost of Goods Sold:Contract labor\",\"\",\"£89.25\",\"\"\r\n\"08/28/2026\",\"Sent Money Yassine\",\"Yassine Achebarrou_G\",\"50005 Cost of Goods Sold:Contract labor\",\"\",\"£184.00\",\"\"\r\n\"09/04/2026\",\"Sent Money Yassine\",\"Yassine Achebarrou_G\",\"50005 Cost of Goods Sold:Contract labor\",\"\",\"£138.00\",\"\"\r\n\"09/11/2026\",\"Sent Money Yassine\",\"Yassine Achebarrou_G\",\"50005 Cost of Goods Sold:Contract labor\",\"\",\"£184.00\",\"\"\r\n\"09/20/2026\",\"Sent Money Yassine\",\"Yassine Achebarrou_G\",\"50005 Cost of Goods Sold:Contract labor\",\"\",\"£184.00\",\"\"";
 const ACCOUNTS = [
   {num:'10005', name:'BUS COMPLETE CHK (6673) - Chicago', bal:434244.92, cur:'USD', bankClass:''},
   {num:'10010', name:'BUS COMPLETE CHK (7232) - NYC', bal:200.00, cur:'USD', bankClass:'NYC'},
@@ -472,19 +507,20 @@ const DEFAULT_CFG = () => ({
     {vendor:'Shashank', gl:'67700 Contractors', cls:'', billOnly:false, note:''},
     {vendor:'Nathalie', gl:'67700 Contractors', cls:'', billOnly:false, note:''}
   ],
-  emailRules: [], bankRules: [], openBills: [],
+  emailRules: [], bankRules: [], openBills: [], newVendorLog: [],
   classOverrides: {}
 });
 
 const S = {
-  view:'results', acctIdx:4, cfg:DEFAULT_CFG(), csv:SAMPLE_CSV, fileName:'Wise UK sample (Wise_UK-2_1.csv)', isSample:true,
-  txs:[], results:[], filter:'all', open:{}, drafts:{}, acks:{}, signed:null, reviewer:'', rulesTab:'vendorMaster', dl:null
+  view:'upload', acctIdx:-1, cfg:DEFAULT_CFG(), csv:'', fileName:'',
+  txs:[], results:[], filter:'all', open:{}, drafts:{}, acks:{}, signed:null, reviewer:'', member:'', rulesTab:'vendorMaster', dl:null
 };
 
 const $ = s => document.querySelector(s);
 const esc = v => String(v == null ? '' : v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const acct = () => Object.assign({}, ACCOUNTS[S.acctIdx], {bankClass: (S.cfg.classOverrides[ACCOUNTS[S.acctIdx].num] ?? ACCOUNTS[S.acctIdx].bankClass)});
-const cur = () => SYM[ACCOUNTS[S.acctIdx].cur] || '';
+const acct = () => { const a = ACCOUNTS[S.acctIdx]; return Object.assign({}, a, {bankClass: (S.cfg.classOverrides[a.num] ?? a.bankClass)}); };
+const cur = () => S.acctIdx < 0 ? '' : (SYM[ACCOUNTS[S.acctIdx].cur] || '');
+const ready = () => S.txs.length > 0;
 const fmt = (n, c) => (n < 0 ? '-' : '') + (c ?? cur()) + Math.abs(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
 const LANE = {bill:'Bill payment', old:'Ready to import', new:'Needs decision', exception:'Exception', scope:'Out of scope'};
 
@@ -496,7 +532,7 @@ function toast(msg){ const t = $('#toast'); t.textContent = msg; t.hidden = fals
 
 /* ---------- engine wiring ---------- */
 function process(){
-  S.txs = Engine.loadFeed(S.csv, acct());
+  S.txs = S.acctIdx < 0 || !S.csv ? [] : Engine.loadFeed(S.csv, acct());
   S.results = Engine.run(S.txs, S.cfg, acct());
   S.drafts = {}; S.acks = {}; S.signed = null; S.open = {};
 }
@@ -508,9 +544,10 @@ function rerun(){
 }
 const counts = () => { const c = {bill:0, old:0, new:0, exception:0, scope:0}; S.results.forEach(r => c[r.lane]++); return c; };
 const waiting = () => S.results.filter(r => r.lane === 'new' && !(r.resolved && r.resolved.confirmed));
+const noData = title => `<div class="pagehead"><div><h2>${title}</h2></div></div><div class="card empty"><b>No bank feed loaded yet.</b>Choose the account and upload the day's CSV first. Nothing is kept from earlier sessions.<br><br><button class="btn primary" data-view="upload">Go to upload</button></div>`;
 const heldEx = () => S.results.filter(r => r.lane === 'exception' && !(r.resolved && r.resolved.confirmed));
 const batch = () => Engine.importRows(S.results);
-const allFlags = () => Engine.checks(batch(), S.results);
+const allFlags = () => Engine.checks(batch());
 
 /* ---------- top bar ---------- */
 function renderSteps(){
@@ -525,7 +562,7 @@ function renderSteps(){
 
 /* ---------- views ---------- */
 function vUpload(){
-  const a = ACCOUNTS[S.acctIdx];
+  const a = S.acctIdx < 0 ? {name:''} : ACCOUNTS[S.acctIdx];
   const banks = ACCOUNTS.map((x, i) => {
     const bc = S.cfg.classOverrides[x.num] ?? x.bankClass;
     return `<div class="acct ${i===S.acctIdx?'sel':''}" data-acct="${i}" role="button" tabindex="0"><span class="mono sub">${x.num}</span><span class="nm">${esc(x.name)}<small>${x.card?'Credit card':'Bank'}${bc?` · class ${esc(bc)}`:''}</small></span><span class="num">${fmt(x.bal, SYM[x.cur])}</span></div>`;
@@ -533,17 +570,18 @@ function vUpload(){
   return `
   <div class="pagehead"><div><h2>Upload the bank feed</h2><p>Export the day's uncategorised transactions from the QBO bank feed as CSV, then pick the account it came from. Nothing leaves your browser.</p></div></div>
   <div class="upgrid">
-    <div class="card"><h3 style="font-size:16px;margin-bottom:8px">1. Which account?</h3><div class="accts">${banks}</div></div>
+    <div class="card"><h3 style="font-size:16px;margin-bottom:8px">1. Which account is this feed from?</h3><div class="accts">${banks}</div></div>
     <div class="card" style="display:flex;flex-direction:column;gap:12px">
       <h3 style="font-size:16px">2. Drop the CSV</h3>
       <label class="drop" id="drop"><b>Drop a file here</b><span class="sub">or click to choose. Columns: Date, DESCRIPTION, Payee, Categorize or match, Class, SPENT, RECEIVED</span><input type="file" id="file" accept=".csv,text/csv" hidden></label>
-      <div class="row"><button class="btn" id="useSample">Use the Wise UK sample</button></div>
+      ${S.acctIdx<0?'<div class="sub">Pick the account on the left first. The bank decides the class.</div>':''}
       ${S.txs.length ? `<div class="banner"><span><b>${esc(S.fileName)}</b><br><span class="sub">${S.txs.length} transactions · ${esc(a.name)}</span></span><button class="btn primary" data-view="results">See results</button></div>`:''}
     </div>
   </div>`;
 }
 
 function vResults(){
+  if(!ready()) return noData('What the automation did');
   const c = counts();
   const t = (k, sub) => `<button class="tile l-${k}" data-filter="${k}" aria-pressed="${S.filter===k}"><span class="big">${c[k]}</span><span class="lbl">${LANE[k]}</span><span class="sub">${sub}</span></button>`;
   const rows = S.results.filter(r => S.filter==='all' || r.lane===S.filter);
@@ -553,14 +591,14 @@ function vResults(){
     const laneLabel = conf ? 'Confirmed' : LANE[r.lane];
     const lane = conf ? 'old' : r.lane;
     const acc = (conf || r.lane==='old' || r.lane==='new') && f.gl ? `${esc(f.gl)}<div class="sub">${esc(f.cls||'')}${r.adminReview?' <span class="flagchip">Admin review</span>':''}</div>` : `<span class="sub">-</span>`;
-    return `<tr class="clickable" data-open="${r.id}"><td class="mono">${esc(r.date)}</td><td class="ellip"><b>${esc(r.vendor||'(none)')}</b><div class="sub">${esc(r.desc)}</div></td><td class="r num ${r.amount>0?'in':''}">${fmt(r.amount)}</td><td><span class="chip l-${lane}">${laneLabel}</span></td><td>${acc}</td></tr>
-    ${S.open[r.id] ? `<tr class="why"><td></td><td colspan="4"><b>${esc(r.reason)}</b><ul>${r.trace.map(x => `<li>${esc(x)}</li>`).join('')}</ul>${r.suggestedGL?`<div class="sub" style="margin-top:6px">QBO's own suggestion (not trusted): ${esc(r.suggestedGL)}</div>`:''}</td></tr>`:''}`;
+    return `<tr class="clickable" data-open="${r.id}"><td class="mono">${esc(r.dateRaw)}</td><td class="ellip"><b>${esc(r.vendor||'(none)')}</b><div class="sub">${esc(r.desc)}</div></td><td class="r num ${r.amount>0?'in':''}">${fmt(r.amount)}</td><td><span class="chip l-${lane}">${laneLabel}</span></td><td>${acc}</td></tr>
+    ${S.open[r.id] ? `<tr class="why"><td></td><td colspan="4"><b>${esc(r.reason)}</b><ul>${r.trace.map(x => `<li>${esc(x)}</li>`).join('')}</ul>${r.suggestedGL?`<div class="sub" style="margin-top:6px">QBO's own suggestion (not trusted): ${esc(r.suggestedGL)}</div>`:''}${r.lane==='scope'?`<div style="margin-top:8px"><button class="btn small" data-force="${r.id}">This is a normal transaction, categorise it</button></div>`:''}</td></tr>`:''}`;
   }).join('');
   const w = waiting().length;
   return `
   <div class="pagehead"><div><h2>What the automation did</h2><p>Every row went through the SOP order: open bills, bank rules, Vendor Master, email rules, then the class waterfall. Click a row to see why.</p></div>
     ${w||heldEx().length ? `<button class="btn primary" data-view="resolve">Resolve ${w+heldEx().length} row${w+heldEx().length===1?'':'s'}</button>` : `<button class="btn primary" data-view="review">Go to review</button>`}</div>
-  ${S.isSample?`<div class="banner"><span>Showing the <b>Wise UK sample</b> from your file. Upload your own on the first tab.</span></div>`:''}
+  <div class="banner"><span><b>${esc(S.fileName)}</b> · ${S.txs.length} transactions · ${esc(acct().name)}</span><button class="btn small" data-view="upload">Upload a different file</button></div>
   <div class="tiles">${t('bill','Pay Bills / Match in QBO')}${t('old','Straight into the import')}${t('new','Team member decides')}${t('exception','Held, not posted')}${t('scope','Journal entries')}</div>
   <div class="row"><span class="sub">${S.filter==='all'?'Showing all '+S.results.length+' rows':'Showing '+rows.length+' '+LANE[S.filter].toLowerCase()}</span>${S.filter!=='all'?'<button class="btn small ghost" data-filter="all">Clear filter</button>':''}</div>
   <div class="tablewrap"><table><thead><tr><th>Date</th><th>Vendor / description</th><th class="r">Amount</th><th>Lane</th><th>Account / class</th></tr></thead><tbody>${body||`<tr><td colspan="5" class="empty">No rows in this lane.</td></tr>`}</tbody></table></div>`;
@@ -574,53 +612,59 @@ function draftFor(r){
   return S.drafts[r.id];
 }
 function vResolve(){
+  if(!ready()) return noData('Resolve');
   const list = S.results.filter(r => r.lane==='new' || r.lane==='exception' || (r.resolved && r.resolved.confirmed && r.lane!=='bill' && r.lane!=='scope'));
-  const done = list.filter(r => r.resolved && r.resolved.confirmed).length;
+  const actionable = list.filter(r => Engine.canConfirm(r) || (r.resolved && r.resolved.confirmed));
+  const done = actionable.filter(r => r.resolved && r.resolved.confirmed).length;
+  const member = `<div class="card row" style="justify-content:space-between"><label class="f" style="min-width:min(100%,260px)">Team member name<input type="text" id="member" value="${esc(S.member)}" placeholder="e.g. Arjun Kapoor"></label><span class="sub" style="max-width:52ch">Recorded in the Memo of every row you confirm, so the Reviewer can see who made each decision.</span></div>`;
   const glList = [...new Set([...S.cfg.vendorMaster.map(v=>v.gl), ...S.results.map(r=>r.suggestedGL), ...S.results.map(r=>r.gl)].filter(Boolean))];
   if(!list.length) return `<div class="pagehead"><div><h2>Resolve</h2></div></div><div class="card empty"><b>Nothing is waiting for a decision.</b>Every row was matched with confidence, sent to the bill list, or is out of scope.<br><br><button class="btn primary" data-view="review">Go to review</button></div>`;
   const cards = list.map(r => {
-    const ok = r.resolved && r.resolved.confirmed; const d = ok ? null : draftFor(r);
+    const ok = r.resolved && r.resolved.confirmed; const held = r.lane==='exception' && !Engine.canConfirm(r); const d = ok || held ? null : draftFor(r);
     return `<div class="card rc ${ok?'done':''} l-${r.lane}" data-card="${r.id}">
-      <div class="rc-head"><div style="min-width:0"><span class="chip l-${ok?'old':r.lane}">${ok?'Confirmed':LANE[r.lane]}</span><div class="sub" style="margin-top:6px">${esc(r.date)} · ${esc(r.desc)}</div></div><div class="amt num ${r.amount>0?'in':''}">${fmt(r.amount)}</div></div>
+      <div class="rc-head"><div style="min-width:0"><span class="chip l-${ok?'old':r.lane}">${ok?'Confirmed':LANE[r.lane]}</span><div class="sub" style="margin-top:6px">${esc(r.dateRaw)} · ${esc(r.desc)}</div></div><div class="amt num ${r.amount>0?'in':''}">${fmt(r.amount)}</div></div>
       <div class="why">${esc(r.reason)}</div>
-      ${ok ? `<div class="row"><span><b>${esc(r.resolved.vendor)}</b> → ${esc(r.resolved.gl)} · ${esc(r.resolved.cls)}</span><button class="btn small ghost" data-undo="${r.id}">Undo</button></div>` : `
+      ${r.lane==='exception' && !Engine.canConfirm(r) ? `<div class="sub"><b>Held.</b> Only the Reviewer and Jonathan can release this row. It goes in the weekly note and stays out of the import file.</div>` : ok ? `<div class="row"><span><b>${esc(r.resolved.vendor)}</b> → ${esc(r.resolved.gl)} · ${esc(r.resolved.cls)}</span><button class="btn small ghost" data-undo="${r.id}">Undo</button></div>` : `
       <div class="two"><label class="f">Vendor<input type="text" data-d="${r.id}" data-k="vendor" value="${esc(d.vendor)}"></label>
       <label class="f">Class<input type="text" list="classes" data-d="${r.id}" data-k="cls" value="${esc(d.cls)}"><span class="hint">${r.proposedWhy?'Proposed from '+esc(r.proposedWhy):''}</span></label></div>
       <label class="f">GL account<input type="text" list="gls" data-d="${r.id}" data-k="gl" value="${esc(d.gl)}" placeholder="e.g. 50005 Cost of Goods Sold:Contract labor"><span class="hint">${r.suggestedGL?'QBO suggested "'+esc(r.suggestedGL)+'". Check it before you accept.':'Type the account exactly as it appears in QBO.'}</span></label>
-      <div class="row" style="justify-content:space-between"><label class="check"><input type="checkbox" data-d="${r.id}" data-k="save" ${d.save?'checked':''}> Add to Vendor Master and New Vendor Log</label><button class="btn primary" data-confirm="${r.id}">Confirm</button></div>`}
+      <div class="row" style="justify-content:space-between"><label class="check"><input type="checkbox" data-d="${r.id}" data-k="save" ${d.save?'checked':''}> Also add to the Vendor Master</label><button class="btn primary" data-confirm="${r.id}">Confirm</button></div>`}
     </div>`;
   }).join('');
   return `
-  <div class="pagehead"><div><h2>Resolve what the rules could not</h2><p>Identify the real vendor, choose the account and class, then confirm. Nothing is guessed: rows you do not confirm stay out of the import.</p></div><div class="row"><progress max="${list.length}" value="${done}"></progress><span class="sub num">${done} of ${list.length} confirmed</span></div></div>
+  <div class="pagehead"><div><h2>Resolve what the rules could not</h2><p>Identify the real vendor, choose the account and class, then confirm. Nothing is guessed: rows you do not confirm stay out of the import.</p></div><div class="row"><progress max="${actionable.length||1}" value="${done}"></progress><span class="sub num">${done} of ${actionable.length} confirmed</span></div></div>
+  ${member}
   <div class="rcards">${cards}</div>
   <datalist id="classes">${CLASSES.map(c=>`<option value="${esc(c)}">`).join('')}</datalist>
   <datalist id="gls">${glList.map(c=>`<option value="${esc(c)}">`).join('')}</datalist>
-  ${done===list.length?`<div class="row"><button class="btn primary" data-view="review">Continue to review</button></div>`:''}`;
+  ${done===actionable.length?`<div class="row"><button class="btn primary" data-view="review">Continue to review</button></div>`:''}`;
 }
 
 function vReview(){
+  if(!ready()) return noData('Reviewer checks and sign-off');
   const rows = batch(), flags = allFlags(), w = waiting().length;
   const spent = rows.filter(r=>r.amount<0).reduce((a,r)=>a+r.amount,0), recv = rows.filter(r=>r.amount>0).reduce((a,r)=>a+r.amount,0);
   const unacked = flags.filter(f => !S.acks[f.id]).length;
   const can = w===0 && unacked===0 && S.reviewer.trim() && rows.length;
   const fl = flags.length ? flags.map(f => `<div class="flag"><label class="check"><input type="checkbox" data-ack="${esc(f.id)}" ${S.acks[f.id]?'checked':''}></label><div><span class="kind sev-${f.severity}">${esc(f.kind)}</span><div><b>${esc(f.title)}</b></div><div class="sub">${esc(f.detail)}</div></div></div>`).join('') : `<div class="empty"><b>No flags.</b>No duplicates, inconsistent vendors, missing vendors or invalid classes in this batch.</div>`;
   return `
-  <div class="pagehead"><div><h2>Reviewer checks and sign-off</h2><p>The automated checks from SOP section 8 run on the combined batch. Tick each flag once you have judged it, then sign off.</p></div></div>
+  <div class="pagehead"><div><h2>Reviewer checks and sign-off</h2><p>The section 8 checks run on the combined Old plus confirmed batch. This is the one hard gate: tick each flag once you have judged it, then sign off. The consistency check only sees this batch, so it is a spot-check, not a history check.</p></div></div>
   <div class="card pop"><div class="stat"><div><span class="sub">Rows in import</span><b class="num">${rows.length}</b></div><div><span class="sub">Money out</span><b class="num">${fmt(spent)}</b></div><div><span class="sub">Money in</span><b class="num">${fmt(recv)}</b></div><div><span class="sub">Held in exceptions</span><b class="num">${heldEx().length}</b></div><div><span class="sub">Admin class review</span><b class="num">${rows.filter(r=>r.adminReview).length}</b></div></div></div>
   ${w?`<div class="banner"><span><b>${w} row${w===1?'':'s'}</b> still need a decision before sign-off.</span><button class="btn" data-view="resolve">Resolve now</button></div>`:''}
   <div class="card"><h3 style="font-size:16px">Flags for the reviewer ${flags.length?`<span class="tag">${flags.length - unacked} of ${flags.length} reviewed</span>`:''}</h3>${fl}</div>
   <div class="card ${S.signed?'':'pop'}">${S.signed ? `<div class="row" style="justify-content:space-between"><span><span class="chip l-old">Signed off</span> by <b>${esc(S.signed.by)}</b> · ${esc(S.signed.at)}</span><button class="btn small" data-view="export">Go to export</button></div>` : `
-    <div class="signoff"><label class="f">Reviewer name<input type="text" id="reviewer" value="${esc(S.reviewer)}" placeholder="e.g. Dhwani"></label><button class="btn primary" id="signBtn" ${can?'':'disabled'}>Sign off batch</button><span class="sub">${!rows.length?'No rows to import.':w?'Resolve all new rows first.':unacked?unacked+' flag(s) still to review.':!S.reviewer.trim()?'Enter the reviewer name.':'Ready. No row can be added after sign-off without repeating this step.'}</span></div>`}</div>`;
+    <div class="signoff"><label class="f">Reviewer name<input type="text" id="reviewer" value="${esc(S.reviewer)}" placeholder="e.g. Meera Iyer"></label><button class="btn primary" id="signBtn" ${can?'':'disabled'}>Sign off batch</button><span class="sub">${!rows.length?'No rows to import.':w?'Resolve all new rows first.':unacked?unacked+' flag(s) still to review.':!S.reviewer.trim()?'Enter the reviewer name.':'Ready. No row can be added after sign-off without repeating this step.'}</span></div>`}</div>`;
 }
 
 function vExport(){
+  if(!ready()) return noData('Export');
   if(!S.signed) return `<div class="pagehead"><div><h2>Export</h2></div></div><div class="card lock"><b style="font-family:var(--font-display);font-size:18px;color:var(--ink)">Locked until the reviewer signs off</b><p>The SOP allows only a signed-off batch into the SaasAnt file.</p><button class="btn primary" data-view="review">Go to review</button></div>`;
   const rows = batch();
   const bills = S.results.filter(r => r.lane==='bill'), adm = rows.filter(r=>r.adminReview), ex = heldEx();
-  const prev = rows.map(r => `<tr><td class="mono">${esc(r.date)}</td><td class="ellip">${esc(r.desc)}</td><td>${esc(r.vendor)}</td><td>${esc(r.gl)}</td><td>${esc(r.cls)}</td><td class="r num">${r.amount.toFixed(2)}</td><td class="sub">${esc(r.memo)}</td></tr>`).join('');
+  const prev = rows.map(r => `<tr><td class="mono">${esc(r.dateRaw)}</td><td class="ellip">${esc(r.desc)}</td><td>${esc(r.vendor)}</td><td>${esc(r.gl)}</td><td>${esc(r.cls)}</td><td class="r num">${r.amount.toFixed(2)}</td><td class="sub">${esc(r.memo)}</td></tr>`).join('');
   const card = (t, p, id, n, primary) => `<div class="card exp"><h3 style="font-size:16px">${t}</h3><p>${p}</p><button class="btn ${primary?'primary':''}" id="${id}" ${n?'':'disabled'}>${n?'Save file ('+n+' rows)':'Nothing to export'}</button></div>`;
   return `
-  <div class="pagehead"><div><h2>Export</h2><p>Signed off by ${esc(S.signed.by)}. Upload the SaasAnt file with the Bank Transactions template. Bill payments are worked directly in QuickBooks and never go into it.</p></div></div>
+  <div class="pagehead"><div><h2>Export</h2><p>Signed off by ${esc(S.signed.by)}. Upload the SaasAnt file with the Bank Transactions template. Bill payments are worked directly in QuickBooks and never go into it. Confirm the header row against your SaasAnt Bank Transactions template before the first real import (SOP section 9).</p></div></div>
   <div class="exports">
     ${card('SaasAnt import file','Date, Description/Name, Vendor, Account, Class, Amount, Memo. Old matches plus confirmed rows.','xImport',rows.length,true)}
     ${card('Bill Payments List','Rows to settle with Pay Bills / Match in QuickBooks. No GL or class.','xBills',bills.length)}
@@ -633,10 +677,11 @@ function vExport(){
 
 /* ---------- rules manager ---------- */
 const TABS = {
-  vendorMaster:{label:'Vendor Master', cols:[['vendor','Vendor'],['gl','GL account'],['cls','Class'],['billOnly','Bill only','check'],['note','Note']], blank:{vendor:'',gl:'',cls:'',billOnly:false,note:''}, help:'Known vendors and their correct account and class. "Bill only" vendors are always paid against a bill and never categorised.'},
-  emailRules:{label:'Jonathan email rules', cols:[['vendor','Vendor'],['gl','GL account'],['cls','Class'],['date','Email date','date'],['note','Note']], blank:{vendor:'',gl:'',cls:'',date:'',note:''}, help:'Instructions from Jonathan. These win over the Vendor Master and bank rules. The most recent one wins.'},
+  vendorMaster:{label:'Vendor Master', cols:[['vendor','Vendor'],['gl','GL account'],['cls','Class'],['billOnly','Bill only','check'],['multiLocation','Multi-location','check'],['note','Note']], blank:{vendor:'',gl:'',cls:'',billOnly:false,multiLocation:false,note:''}, help:'Known vendors and their correct account and class. "Bill only" vendors are always paid against a bill and never categorised. "Multi-location" vendors go to a person when neither the bank account nor the description gives the class.'},
+  emailRules:{label:'Jonathan email rules', cols:[['vendor','Vendor'],['gl','GL account'],['cls','Class'],['date','Email date','date'],['note','Note']], blank:{vendor:'',gl:'',cls:'',date:'',note:''}, help:'Every instruction Jonathan gives by email, dated. Check new emails that are not logged yet before you upload. The most recent email wins over the Vendor Master and bank rules.'},
   bankRules:{label:'Bank rules', cols:[['contains','Description contains'],['vendor','Vendor'],['gl','GL account'],['cls','Class']], blank:{contains:'',vendor:'',gl:'',cls:''}, help:'A rule fires only when the description text and the vendor both match. A description-only match is held as a possible misfire.'},
   openBills:{label:'Open bills', cols:[['vendor','Vendor'],['amount','Amount','number'],['date','Bill date','date']], blank:{vendor:'',amount:0,date:''}, help:'Open bills in QuickBooks. A payment for the same vendor and amount goes to the Bill Payments List instead of being categorised.'},
+  newVendorLog:{label:'New Vendor Log', cols:[['vendor','Vendor'],['gl','Proposed GL'],['cls','Proposed class'],['date','Coded on','date'],['by','Coded by'],['status','Status']], blank:{vendor:'',gl:'',cls:'',date:'',by:'',status:'proposed'}, help:'Filled automatically the moment a new vendor is confirmed. Stays "proposed" until it appears in the weekly send to Jonathan and is not challenged.'},
   accounts:{label:'Account classes'}
 };
 function vRules(){
@@ -676,19 +721,22 @@ async function copyText(text, ok){
   try{ await navigator.clipboard.writeText(text); toast(ok); } catch(e){ toast('Copy is blocked in this view.'); }
 }
 function weeklyNote(){
-  const rows = batch(); const nv = S.results.filter(r => r.resolved && r.resolved.confirmed && r.resolved.isNewVendor);
+  const rows = batch();
   const L = ['Weekly categorisation update', ''];
-  L.push('New vendors (proposed account and class):'); nv.length ? nv.forEach(r => L.push(`- ${r.resolved.vendor}: ${r.resolved.gl} / ${r.resolved.cls}`)) : L.push('- none');
-  L.push('', 'Administrative class review (please confirm or redirect):'); const a = rows.filter(r=>r.adminReview); a.length ? a.forEach(r => L.push(`- ${r.date} ${r.vendor} ${fmt(r.amount)} (${r.gl})`)) : L.push('- none');
-  L.push('', 'Unresolved exceptions:'); const e = heldEx(); e.length ? e.forEach(r => L.push(`- ${r.date} ${r.vendor||r.desc} ${fmt(r.amount)}: ${r.reason}`)) : L.push('- none');
+  L.push('New Vendor Log (proposed account and class, please confirm or correct):');
+  const nv = S.cfg.newVendorLog.filter(v => v.status==='proposed'); nv.length ? nv.forEach(v => L.push(`- ${v.vendor}: ${v.gl} / ${v.cls} (coded ${v.date})`)) : L.push('- none');
+  L.push('', 'Administrative class review (please confirm or redirect to the real class):');
+  const a = rows.filter(r=>r.adminReview); a.length ? a.forEach(r => L.push(`- ${r.dateRaw} ${r.vendor} ${fmt(r.amount)} (${r.gl})`)) : L.push('- none');
+  L.push('', 'Unresolved exceptions:');
+  const e = S.results.filter(r => r.lane==='exception' && !(r.resolved && r.resolved.confirmed)); e.length ? e.forEach(r => L.push(`- ${r.dateRaw} ${r.vendor||r.desc} ${fmt(r.amount)}: ${r.reason}`)) : L.push('- none');
   return L.join('\n');
 }
-function loadText(text, name, sample){
-  S.csv = text; S.fileName = name; S.isSample = !!sample;
-  try{ process(); }catch(e){ toast('That file could not be read as a bank feed CSV.'); return; }
-  if(!S.txs.length){ toast('No transactions found. Check the column headers.'); return; }
-  S.filter = 'all'; S.view = 'results'; render();
-  toast(`Loaded ${S.txs.length} transactions`);
+function loadText(text, name){
+  S.csv = text; S.fileName = name; S.filter = 'all';
+  if(S.acctIdx < 0){ S.txs = []; S.results = []; toast('File received. Now pick the account it came from.'); return render(); }
+  process();
+  if(!S.txs.length){ S.csv = ''; toast('No transactions found. Check the column headers (Date, DESCRIPTION, Payee, SPENT, RECEIVED).'); return render(); }
+  S.view = 'results'; render(); toast(`Loaded ${S.txs.length} transactions`);
 }
 
 document.addEventListener('click', e => {
@@ -698,21 +746,25 @@ document.addEventListener('click', e => {
   if(d.view) return go(d.view);
   if(d.filter){ S.filter = S.filter===d.filter && d.filter!=='all' ? 'all' : d.filter; return render(); }
   if(d.open){ S.open[d.open] = !S.open[d.open]; return render(); }
-  if(d.acct){ S.acctIdx = +d.acct; if(S.txs.length){ process(); } return render(); }
+  if(d.acct){ S.acctIdx = +d.acct; if(S.csv){ process(); if(S.txs.length){ S.view='results'; toast(`Loaded ${S.txs.length} transactions`); } } return render(); }
   if(d.rtab){ S.rulesTab = d.rtab; return render(); }
   if(d.add){ S.cfg[S.rulesTab].push(Object.assign({}, TABS[S.rulesTab].blank)); saveCfg(); return render(); }
   if(d.del!==undefined){ S.cfg[S.rulesTab].splice(+d.del, 1); saveCfg(); rerun(); return render(); }
   if(d.undo){ const r = S.results.find(x => x.id===d.undo); r.resolved = null; S.signed = null; return render(); }
+  if(d.force){ const tx = S.txs.find(x => x.id===d.force); tx.force = true; rerun(); toast('Moved into categorisation'); return render(); }
   if(d.confirm){
     const r = S.results.find(x => x.id===d.confirm), dr = S.drafts[r.id];
-    const bad = Engine.RESERVED_CLASSES.some(x => x.toLowerCase()===dr.cls.trim().toLowerCase());
+    const bad = Engine.isReserved(dr.cls);
+    if(!S.member.trim()) return toast('Enter the team member name first.');
     if(!dr.vendor.trim() || !dr.gl.trim() || !dr.cls.trim()) return toast('Vendor, GL account and class are all required.');
     if(bad) return toast(`"${dr.cls}" is reserved for Steven Garcia's personal book. Choose an Empire class.`);
     const isNew = !S.cfg.vendorMaster.some(v => Engine.vendorKey(v.vendor)===Engine.vendorKey(dr.vendor));
-    r.resolved = {confirmed:true, vendor:dr.vendor.trim(), gl:dr.gl.trim(), cls:dr.cls.trim(), by:'team member', isNewVendor: dr.save && isNew};
+    r.resolved = {confirmed:true, vendor:dr.vendor.trim(), gl:dr.gl.trim(), cls:dr.cls.trim(), by:S.member.trim(), isNewVendor: isNew};
+    if(isNew && !S.cfg.newVendorLog.some(v => Engine.vendorKey(v.vendor)===Engine.vendorKey(dr.vendor))) S.cfg.newVendorLog.push({vendor:dr.vendor.trim(), gl:dr.gl.trim(), cls:dr.cls.trim(), date:new Date().toISOString().slice(0,10), by:S.member.trim(), status:'proposed'});
     let extra = 0;
+    saveCfg();
     if(dr.save && isNew){
-      S.cfg.vendorMaster.push({vendor:dr.vendor.trim(), gl:dr.gl.trim(), cls:'', billOnly:false, note:'Added '+new Date().toISOString().slice(0,10)+' from '+S.fileName});
+      S.cfg.vendorMaster.push({vendor:dr.vendor.trim(), gl:dr.gl.trim(), cls:'', billOnly:false, multiLocation:false, note:'Added '+new Date().toISOString().slice(0,10)+' by '+S.member.trim()});
       saveCfg();
       const before = S.results.filter(x=>x.lane==='old' && x.id!==r.id).length; const keep = new Map(S.results.map(x => [x.id, x.resolved]));
       S.results = Engine.run(S.txs, S.cfg, acct()); S.results.forEach(x => x.resolved = keep.get(x.id)||null);
@@ -722,11 +774,10 @@ document.addEventListener('click', e => {
     return toast(extra>0 ? `Confirmed. ${extra} other row(s) now match ${dr.vendor.trim()} automatically.` : 'Confirmed');
   }
   if(t.id==='rulesBtn') return go('rules');
-  if(t.id==='useSample') return loadText(SAMPLE_CSV, 'Wise UK sample (Wise_UK-2_1.csv)', true);
   if(t.id==='signBtn'){ S.signed = {by:S.reviewer.trim(), at:new Date().toLocaleString()}; return render(); }
   if(t.id==='xImport') return saveFile('SaasAnt_Import_'+new Date().toISOString().slice(0,10)+'.csv', Engine.saasantCSV(batch()));
-  if(t.id==='xBills') return saveFile('Bill_Payments_List.csv', Engine.toCSV([['Date','Vendor','Description','Amount','Status','Note']].concat(S.results.filter(r=>r.lane==='bill').map(r=>[r.date,r.vendor,r.desc,r.amount.toFixed(2),r.billStatus==='match'?'Open bill matched':r.billStatus==='amount'?'Check amount':'Enter bill first',r.reason]))));
-  if(t.id==='xAdmin') return saveFile('Administrative_Class_Review_List.csv', Engine.toCSV([['Date','Vendor','Description','Amount','GL','Class']].concat(batch().filter(r=>r.adminReview).map(r=>[r.date,r.vendor,r.desc,r.amount.toFixed(2),r.gl,r.cls]))));
+  if(t.id==='xBills') return saveFile('Bill_Payments_List.csv', Engine.toCSV([['Date','Vendor','Description','Amount','Status','Note']].concat(S.results.filter(r=>r.lane==='bill').map(r=>[r.dateRaw,r.vendor,r.desc,r.amount.toFixed(2),r.billStatus==='match'?'Open bill matched':r.billStatus==='amount'?'Check amount':'Enter bill first',r.reason]))));
+  if(t.id==='xAdmin') return saveFile('Administrative_Class_Review_List.csv', Engine.toCSV([['Date','Vendor','Description','Amount','GL','Class']].concat(batch().filter(r=>r.adminReview).map(r=>[r.dateRaw,r.vendor,r.desc,r.amount.toFixed(2),r.gl,r.cls]))));
   if(t.id==='xWeekly') return copyText(weeklyNote(), 'Weekly note copied');
   if(t.id==='resetCfg'){ S.cfg = DEFAULT_CFG(); saveCfg(); rerun(); toast('Rules reset to defaults'); return render(); }
 });
@@ -734,6 +785,7 @@ document.addEventListener('keydown', e => { if((e.key==='Enter'||e.key===' ') &&
 
 document.addEventListener('input', e => {
   const t = e.target;
+  if(t.id==='member'){ S.member = t.value; return; }
   if(t.id==='reviewer'){ S.reviewer = t.value; const b = $('#signBtn'); if(b){ const rows = batch(); b.disabled = !(waiting().length===0 && allFlags().every(f=>S.acks[f.id]) && S.reviewer.trim() && rows.length); } return; }
   if(t.dataset.d){ const d = S.drafts[t.dataset.d]; d[t.dataset.k] = t.type==='checkbox' ? t.checked : t.value; }
 });
@@ -746,13 +798,13 @@ document.addEventListener('change', e => {
     row[d.k] = t.type==='checkbox' ? t.checked : t.type==='number' ? parseFloat(t.value)||0 : t.value.trim();
     saveCfg(); rerun(); return;
   }
-  if(t.id==='file' && t.files[0]){ const f = t.files[0], rd = new FileReader(); rd.onload = () => loadText(String(rd.result), f.name, false); rd.readAsText(f); }
+  if(t.id==='file' && t.files[0]){ const f = t.files[0], rd = new FileReader(); rd.onload = () => loadText(String(rd.result), f.name); rd.readAsText(f); }
 });
 document.addEventListener('dragover', e => { const z = e.target.closest('#drop'); if(z){ e.preventDefault(); z.classList.add('over'); } });
 document.addEventListener('dragleave', e => { const z = e.target.closest('#drop'); if(z) z.classList.remove('over'); });
-document.addEventListener('drop', e => { const z = e.target.closest('#drop'); if(z){ e.preventDefault(); z.classList.remove('over'); const f = e.dataTransfer.files[0]; if(f){ const rd = new FileReader(); rd.onload = () => loadText(String(rd.result), f.name, false); rd.readAsText(f); } } });
+document.addEventListener('drop', e => { const z = e.target.closest('#drop'); if(z){ e.preventDefault(); z.classList.remove('over'); const f = e.dataTransfer.files[0]; if(f){ const rd = new FileReader(); rd.onload = () => loadText(String(rd.result), f.name); rd.readAsText(f); } } });
 
-loadCfg(); process(); render();
+loadCfg(); render();
 try{ if(window.claude && claude.use) claude.use('downloads').then(d => { S.dl = d; }).catch(() => {}); }catch(e){}
 </script>
 

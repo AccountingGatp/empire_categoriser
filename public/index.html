@@ -448,14 +448,15 @@ const Engine = (() => {
       const bills = (cfg.openBills || []).filter(b => baseKey(b.vendor) === vkey);
       const hit = bills.find(b => b.amount > 0 && Math.abs(b.amount - Math.abs(tx.amount)) < 0.005);
       const nBills = bills.filter(b => !b.total && b.amount > 0).length;
-      const patt = (cfg.billOnlyPatterns || DEFAULT_BILL_ONLY).some(p => vkey.includes(norm(p)));
+      const isA2 = !!(rec && rec.tier === 'A2');   // Yassine hybrid: the Vendor Master amount map decides, not the bill-only name list
+      const patt = !isA2 && (cfg.billOnlyPatterns || DEFAULT_BILL_ONLY).some(p => vkey.includes(norm(p)));
       if (hit) {
         out.lane = 'bill'; out.billStatus = 'match';
         out.reason = `Matches ${hit.total ? 'the total open balance' : 'an open bill'} of ${hit.amount.toFixed(2)}${hit.bucket ? ' (A/P aging: ' + hit.bucket + ')' : hit.date ? ' dated ' + hit.date : ''}${hit.no ? ' (bill ' + hit.no + ')' : ''}. Confirm with Pay Bills / Match in QBO.`;
         trace.push('Step 2: open bill found for this vendor and amount. Routed to the Bill Payments List, not categorised.');
         return out;
       }
-      if (nBills) {
+      if (nBills && !isA2) {
         out.lane = 'bill'; out.billStatus = 'amount';
         out.reason = `Vendor has open bills (${nBills} on the A/P report), none for this amount. A person checks for a part-payment before matching.`;
         trace.push('Step 2: vendor has open bills but the amount differs. Routed to the Bill Payments List.');
@@ -501,6 +502,28 @@ const Engine = (() => {
         return stevenRow(out, tx, cfg, 'Steven Garcia personal charge on an Empire account (Vendor Master tier E, SOP 13.2).', trace);
       }
       if (rec.tier === 'F') { out.lane = 'exception'; out.exKind = 'reserved'; out.reason = 'History uses a class reserved for Steven personal book, or Unclassified. Never posted in Empire (SOP 13.2).'; return out; }
+      /* Tier A2, Yassine hybrid (Vendor Master sheet "Yassine Amount Map", Dhwani 2026-10-01). An open Bill of the same amount was already
+         routed to the Bill Payments List above. Otherwise the payment amount decides. Only the Wise GBP record (_G) follows the map. */
+      if (rec.tier === 'A2' && tx.amount < 0) {
+        const a = Math.round(Math.abs(tx.amount) * 100) / 100;
+        const hold = (kind, why) => { out.lane = 'exception'; out.exKind = kind; out.reason = why; trace.push('Yassine amount map: ' + why); return out; };
+        if (!/_G$/i.test(rec.vendor)) return hold('amountmap', 'Yassine on the USD (Chase) record. Wires to Yassine without the Wise GBP record go to the Exception Queue: ask Jonathan (Yassine amount map #9).');
+        if (!cfg.openBillsChecked) { out.reason = 'Yassine payments depend on whether an open Expensify Bill exists (amount map #1). Load the open bills, or confirm there are none.'; trace.push('Yassine amount map: open-bills data missing. Held.'); return out; }
+        const post = (glName, n, note) => {
+          const c = coaResolve(cfg.coa, glName);
+          if (c.error) { out.reason = `GL "${glName}" from the Yassine amount map (#${n}) is ${c.error === 'ambiguous' ? 'ambiguous' : 'not'} in the chart of accounts. Pick the right account.`; trace.push('Yassine amount map: GL not usable. Held.'); return out; }
+          out.gl = c.name; out.glVerified = c.verified; out.cls = rec.cls; out.source = 'Yassine amount map #' + n; out.lane = 'old';
+          if (isReserved(out.cls)) { out.lane = 'exception'; out.exKind = 'reserved'; out.reason = `Class "${out.cls}" is not allowed in Empire.`; return out; }
+          trace.push(`Yassine amount map #${n}: ${a.toFixed(2)} with no open Bill is an Expense, ${glName}, ${rec.cls}.${note ? ' ' + note : ''}`);
+          return out;
+        };
+        if (a === 1850 || a === 1750) return post('Building & land rent', 6);
+        if (a === 32.5 || a === 34.5) { out.lane = 'bill'; out.billStatus = 'nobill'; out.reason = 'Monthly phone amount (32.50 / 34.50) is a Bill (Phone service, London). Enter the Bill, then Pay Bills / Match (Yassine amount map #7).'; trace.push('Yassine amount map #7: phone bill.'); return out; }
+        if (a === 7) return hold('amountmap', 'A 7.00 payment with no memo. Exception if there is no description (Yassine amount map #4).');
+        if (a < 500) return post('Contract labor', 2, 'The map notes that 8 similar entries since the Sep 25 reclass sit in Other Business Expenses, so the Reviewer confirms the GL.');
+        if (a >= 1650 && a <= 5700) return post('City Manager Salary', 5);
+        return hold('amountmap', `Amount ${a.toFixed(2)} is outside the Yassine amount map (under 500, 1,650 to 5,700, or the fixed amounts). A person decides.`);
+      }
       if (rec.tier === 'D') { out.lane = 'exception'; out.exKind = 'payroll'; out.reason = 'Payroll / City Manager split is pending in QuickBooks. Never auto-coded and no bank rule (SOP 13.3).'; return out; }
     }
 
@@ -795,8 +818,8 @@ const ACCOUNTS = [
 ];
 const SYM = {USD:'$', GBP:'£', EUR:'€'};
 const LANE = {bill:'Bill payment', old:'Ready to import', new:'Needs decision', exception:'Exception', scope:'Out of scope'};
-const EXK = {novendor:'No vendor', personal:'Personal-book keyword', reserved:'Reserved class', payroll:'Payroll split pending', steven:'Steven personal'};
-const TIERS = {A:'Bill-payment-only', B:'Auto-match ready', C1:'GL fixed, class needs waterfall', C2:'Several GLs, ask', C3:'GL not captured, open the bill', D:'Payroll / City Manager split', E:'Steven personal', F:'Reserved class history'};
+const EXK = {novendor:'No vendor', personal:'Personal-book keyword', reserved:'Reserved class', payroll:'Payroll split pending', steven:'Steven personal', amountmap:'Yassine amount map'};
+const TIERS = {A:'Bill-payment-only', A2:'Hybrid: bill + small expense (Yassine)', B:'Auto-match ready', C1:'GL fixed, class needs waterfall', C2:'Several GLs, ask', C3:'GL not captured, open the bill', D:'Payroll / City Manager split', E:'Steven personal', F:'Reserved class history'};
 
 const DEFAULT_CFG = () => ({
   emailRules: [], bankRules: [], payrollMap: [], openBills: [], noOpenBills: false, billsAt: '', newVendorLog: [],

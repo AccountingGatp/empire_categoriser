@@ -1385,20 +1385,37 @@ async function importPayroll(f){
   const {sheets, names} = await readSheets(f);
   const classes = classList(), byLast = {};
   classes.forEach(c => { const l = Engine.norm(c.split(':').pop()); (byLast[l] = byLast[l] || []).push(c); });
-  const toClass = raw => { const v = String(raw||'').trim(); if(!v) return ''; const n = Engine.norm(v); const ex = classes.find(c => Engine.norm(c) === n); if(ex) return ex; const l = byLast[n]; return l && l.length===1 ? l[0] : ''; };
-  const found = []; let skipped = 0;
+  const toClass = raw => {
+    const v = String(raw||'').trim(); if(!v) return '';
+    const tries = [v, v.replace(/\s+tours?$/i, ''), v.replace(/\s+tours?$/i, '').replace(/^dc$/i, 'Washington DC')];
+    for(const t of tries){ const n = Engine.norm(t); const ex = classes.find(c => Engine.norm(c) === n); if(ex) return ex; const l = byLast[n]; if(l && l.length === 1) return l[0]; }
+    return '';
+  };
+  const NAME = /^(employee|name|payee|vendor|person|staff)( name)?$/, CLS = /^(class|location|department|entity|team|job)$/;
+  const rows = []; let skipped = 0; const unknownJobs = {};
   names.forEach(sn => {
     const aoa = sheets[sn];
-    const h = aoa.findIndex(r => r.some(c => /^(employee|name|payee|vendor|person|staff)( name)?$/i.test(String(c).trim())) && r.some(c => /^(class|location|department|entity|team)$/i.test(String(c).trim())));
+    const low = r => r.map(c => String(c).trim().toLowerCase());
+    const h = aoa.findIndex(r => { const L = low(r); return L.some(c => CLS.test(c)) && (L.some(c => NAME.test(c)) || (L.includes('first name') && L.includes('last name'))); });
     if(h < 0) return;
-    const H = aoa[h].map(x => String(x).trim().toLowerCase());
-    const iN = H.findIndex(x => /^(employee|name|payee|vendor|person|staff)( name)?$/.test(x)), iC = H.findIndex(x => /^(class|location|department|entity|team)$/.test(x));
-    aoa.slice(h + 1).forEach(r => { const n = String(r[iN]||'').trim(); if(!n) return; const c = toClass(r[iC]); if(c) found.push({name:n, cls:c}); else if(String(r[iC]||'').trim()) skipped++; });
+    const H = low(aoa[h]);
+    const iN = H.findIndex(x => NAME.test(x)), iF = H.indexOf('first name'), iL = H.indexOf('last name'), iC = H.findIndex(x => CLS.test(x));
+    aoa.slice(h + 1).forEach(r => {
+      const n = (iN >= 0 ? String(r[iN]||'') : (String(r[iF]||'') + ' ' + String(r[iL]||''))).replace(/\s+/g, ' ').trim(); if(!n) return;
+      const raw = String(r[iC]||'').trim(); if(!raw) return;          // no job/class on the line = not paid this period
+      const c = toClass(raw); if(c) rows.push({name:n, cls:c}); else { skipped++; unknownJobs[raw] = (unknownJobs[raw]||0) + 1; }
+    });
   });
-  if(!found.length) throw new Error('Could not find an Employee (or Name) column together with a Class column, with classes that exist in the class list. Please send this file so it can be matched.');
-  const seen = new Map(); found.forEach(x => seen.set(Engine.norm(x.name), x));
-  S.cfg.payrollMap = [...seen.values()].map(x => Object.assign({_id:rid()}, x));
-  saveAll(); rerun(); toast(`Payroll classes loaded: ${S.cfg.payrollMap.length} employees${skipped?`, ${skipped} row(s) skipped because the class is not in the class list`:''}`);
+  if(!rows.length) throw new Error('Could not find a Name (or First name + Last name) column together with a Class / Job column whose values match the class list. Please send this file so it can be matched.');
+  const by = new Map(), conflict = new Set();
+  rows.forEach(x => { const k = Engine.norm(x.name), p = by.get(k); if(p && p.cls !== x.cls) conflict.add(k); else by.set(k, x); });
+  conflict.forEach(k => by.delete(k));
+  S.cfg.payrollMap = [...by.values()].map(x => Object.assign({_id:rid()}, x));
+  saveAll(); rerun();
+  const notes = [];
+  if(skipped) notes.push(`${skipped} line(s) skipped: ${Object.entries(unknownJobs).map(([k, v]) => `"${k}" (${v})`).join(', ')} is not in the class list`);
+  if(conflict.size) notes.push(`${conflict.size} person(s) on two different classes were left out`);
+  toast(`Payroll classes loaded: ${S.cfg.payrollMap.length} employees${notes.length ? '. ' + notes.join('; ') : ''}`);
 }
 async function importTable(tab, f){
   const {sheets, names} = await readSheets(f); const aoa = sheets[names[0]]; if(!aoa.length) throw new Error('The file is empty.');

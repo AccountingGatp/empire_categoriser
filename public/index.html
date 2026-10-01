@@ -32,12 +32,12 @@ button,input,select,textarea{font:inherit;color:inherit}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
 .topbar{position:sticky;top:env(safe-area-inset-top,0px);z-index:10;background:var(--surface);border-bottom:1px solid var(--line)}
-.topin{max-width:1180px;margin:0 auto;padding:10px 16px;display:flex;align-items:center;gap:20px;flex-wrap:wrap}
+.topin{max-width:1180px;margin:0 auto;padding:10px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .brand{display:flex;flex-direction:column;line-height:1.1}
 .brand b{font-family:var(--font-display);font-size:18px;font-weight:700}
 .brand span{font-size:11px;color:var(--muted);letter-spacing:.06em;text-transform:uppercase}
-.steps{display:flex;gap:4px;overflow-x:auto;flex:1;min-width:0;padding:2px}
-.step{appearance:none;background:none;border:0;border-radius:8px;padding:7px 12px;cursor:pointer;display:flex;align-items:center;gap:8px;color:var(--muted);white-space:nowrap;font-weight:500}
+.steps{display:flex;gap:2px;overflow-x:auto;flex:1 1 440px;min-width:0;padding:2px}
+.step{appearance:none;background:none;border:0;border-radius:8px;padding:7px 9px;cursor:pointer;display:flex;align-items:center;gap:8px;color:var(--muted);white-space:nowrap;font-weight:500}
 .step .n{width:20px;height:20px;border-radius:50%;border:1.5px solid currentColor;font-size:11px;display:grid;place-items:center;font-family:var(--font-mono)}
 .step:hover{background:var(--surface-2);color:var(--ink)}
 .step[aria-current="page"]{background:var(--accent-soft);color:var(--accent)}
@@ -91,6 +91,7 @@ textarea{min-height:90px;resize:vertical}
 .tile .big{font-family:var(--font-display);font-size:28px;font-weight:700;line-height:1.1}
 .tile .lbl{font-weight:600;font-size:13px}
 .tile .sub{font-size:12px;color:var(--muted)}
+.tag[class*="l-"]{color:var(--c);border-color:var(--c)}
 .l-bill{--c:var(--c-bill)}.l-old{--c:var(--c-old)}.l-new{--c:var(--c-new)}.l-exception{--c:var(--c-exc)}.l-scope{--c:var(--c-scope)}
 .chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;padding:2px 9px;border-radius:99px;color:var(--c);background:color-mix(in srgb,var(--c) 13%,transparent);white-space:nowrap}
 .chip::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--c)}
@@ -178,6 +179,7 @@ td input[type=checkbox]{width:18px;height:18px}
   <div class="brand"><b>Empire Categoriser</b><span>Bank feed to SaasAnt</span></div>
   <nav class="steps" id="steps" aria-label="Steps"></nav>
   <span class="pill off" id="cloudPill">This browser only</span>
+  <button class="btn rulesbtn" id="auditBtn">Check old file</button>
   <button class="btn rulesbtn" id="dataBtn">Data &amp; rules</button>
 </div></header>
 <main class="wrap" id="app"></main>
@@ -411,7 +413,8 @@ const Engine = (() => {
     /* SOP 1: journal-entry-driven items never enter this pipeline */
     if (!tx.force) {
       const g = glNumber(tx.suggestedGL);
-      const kw = SCOPE_KEYWORDS.find(k => hasWord(descL, k) || hasWord(vkey, k));
+      // "transfer" means an inter-account transfer. A WIRE TRANSFER to a named beneficiary is a payment to a third party, so it is not out of scope.
+      const kw = SCOPE_KEYWORDS.find(k => (hasWord(descL, k) || hasWord(vkey, k)) && !(k === 'transfer' && /\bwire\b/.test(descL)));
       const eq = g !== null && g >= 30000 && g < 40000;
       const conv = /(convert|conversion|exchange)/i.test(tx.desc);
       const ex = tx.amount > 0 && (cfg.excluded || []).find(e => baseKey(e.vendor) === vkey && /sales clearing/i.test(e.gl || ''));
@@ -624,6 +627,59 @@ const Engine = (() => {
     });
   }
 
+
+  /* ---------- check an older, already-categorised file against the SOP (read-only) ---------- */
+  function parseFileSide(rec) {
+    const L = {}; Object.keys(rec).forEach(k => { L[k.toLowerCase().trim()] = rec[k]; });
+    const first = (...n) => { for (const k of n) if (L[k] != null && String(L[k]).trim() !== '') return String(L[k]).trim(); return ''; };
+    const out = { how: '', type: '', num: '', name: '', gl: '', cls: first('class', 'expense line class', 'line class'), rule: false };
+    const ab = first('added or matched');
+    if (ab) {
+      const m = ab.match(/^(Added to|Matched to):\s+([A-Za-z][A-Za-z ]*?):\s*(\d+(?:\.\d+)?)?\s*(.*?)(?:\s+DD)?\s+\d{1,2}\/\d{1,2}\/\d{4}/i);
+      if (m) { out.how = /^added/i.test(m[1]) ? 'added' : 'matched'; out.type = m[2].trim(); out.num = m[3] || ''; out.name = (m[4] || '').trim(); }
+      out.rule = /rule applied/i.test(first('rule'));
+    } else {
+      const g = first('gl account', 'categorize or match', 'account', 'category', 'expense account', 'line account', 'gl');
+      const m = g.match(/^\s*(\d+(?:\.\d+)?)\s+(.*)$/);
+      out.num = m ? m[1] : ''; out.name = m ? m[2] : g;
+    }
+    out.gl = (out.num ? out.num + ' ' : '') + out.name;
+    return out;
+  }
+  function audit(csvText, account, cfg, prefix) {
+    const recs = csvToObjects(csvText);
+    const txs = loadFeed(csvText, account, prefix || 'a').map(t => Object.assign(t, { suggestedGL: '', suggestedClass: '' }));
+    const res = run(txs, cfg);
+    const sameGl = (f, sgl) => {
+      const sn = glNumber(sgl), fn = f.num ? parseInt(f.num, 10) : null;
+      if (sn !== null && fn !== null) return sn === fn;
+      const last = x => norm(stripNum(x).split(':').pop());
+      return last(f.name) === last(sgl);
+    };
+    const sameCls = (a, b) => { const l = x => norm(String(x).split(':').pop()); return norm(a) === norm(b) || l(a) === l(b); };
+    return res.map(r => {
+      const i = parseInt(String(r.id).split('-t').pop(), 10), f = parseFileSide(recs[i] || {});
+      const fnum = f.num ? parseInt(f.num, 10) : null;
+      const sop = { lane: r.lane, gl: r.gl || '', cls: r.cls || '', reason: r.reason || '' };
+      let status, label, why;
+      if (/uncategor/i.test(f.name)) { status = 'rule'; label = 'Left uncategorised'; why = 'The file has this posted to "' + f.gl + '". It still needs a real account.'; }
+      else if (f.cls && isReserved(f.cls)) { status = 'rule'; label = 'Reserved class used'; why = 'Class "' + f.cls + '" is never valid in Empire QuickBooks (SOP 13.2).'; }
+      else if (f.cls && isOwnerClass(f.cls) && !r.steven) { status = 'rule'; label = 'Owner Distribution class'; why = 'Owner Distribution is only for Steven personal charges (SOP 13.2).'; }
+      else if (r.lane === 'scope' || /^transfer$/i.test(f.type) || fnum === 10031 || (fnum !== null && fnum >= 30000 && fnum < 40000)) { status = 'scope'; label = 'Out of scope'; why = r.lane === 'scope' ? r.reason : 'Journal-entry item (sales clearing, equity or transfer). SOP section 1.'; }
+      else if (r.lane === 'exception') { status = 'unknown'; label = 'Cannot verify'; why = r.reason; }
+      else if (r.lane === 'new') { status = 'unknown'; label = 'Cannot verify'; why = r.reason || 'Vendor is new or has several possible GLs.'; }
+      else if (r.lane === 'bill') {
+        if (/bill payment/i.test(f.type) || !f.type) { status = 'ok'; label = 'Matches'; why = 'SOP: bill payment.'; }
+        else { status = 'diff'; label = 'Different treatment'; why = 'SOP: ' + (r.reason || 'bill payment') + ' The file has it as ' + f.type + '.'; }
+      }
+      else if (/bill payment/i.test(f.type)) { status = 'unknown'; label = 'Cannot verify'; why = 'Paid as a Bill Payment. The SOP would code this directly unless an open bill existed that day, and the A/P report for that day is not available.'; }
+      else if (!sameGl(f, r.gl)) { status = 'diff'; label = 'Different GL'; why = 'File: ' + (f.gl || '(none)') + '. SOP: ' + r.gl + (r.source ? ' (' + r.source + ')' : '') + '.'; }
+      else if (f.cls && r.cls && !sameCls(f.cls, r.cls)) { status = 'diff'; label = 'Different class'; why = 'File: ' + f.cls + '. SOP: ' + r.cls + (r.source ? ' (' + r.source + ')' : '') + '.'; }
+      else { status = 'ok'; label = 'Matches'; why = 'GL' + (f.cls ? ' and class' : '') + ' agree with the SOP.'; }
+      return { id: r.id, dateRaw: r.dateRaw, desc: r.desc, payee: r.payee || r.vendor, amount: r.amount, status, label, why, file: { type: f.type, how: f.how, gl: f.gl, cls: f.cls, rule: f.rule }, sop };
+    });
+  }
+
   /* ---------- outputs ---------- */
   const isConfirmed = r => !!(r.resolved && r.resolved.confirmed);
   const canConfirm = r => r.lane === 'new' || (r.lane === 'exception' && r.exKind === 'novendor');
@@ -718,7 +774,7 @@ const Engine = (() => {
     return { expenses: exp, deposits: dep, nExp: ne, nDep: nd, warn };
   }
 
-  return { parseCSV, csvToObjects, toCSV, loadFeed, run, importRows, checks, saasantSheets, SA_EXP, SA_DEP, parseMaster, masterIndex: masterHeader, deriveLists, buildIndex, resolveVendor, suggestVendors, coaResolve, MASTER_COLS,
+  return { audit, parseFileSide, parseCSV, csvToObjects, toCSV, loadFeed, run, importRows, checks, saasantSheets, SA_EXP, SA_DEP, parseMaster, masterIndex: masterHeader, deriveLists, buildIndex, resolveVendor, suggestVendors, coaResolve, MASTER_COLS,
     baseKey, norm, money, isReserved, isAdminClass, isOwnerClass, stevenGl, OWNER_CLASS, canConfirm, isConfirmed, eff, mapClass, isPL, glNumber, stripNum,
     RESERVED, DEFAULT_CLASS_MAP, DEFAULT_US_PAYROLL, DEFAULT_BILL_ONLY };
 })();
@@ -753,7 +809,7 @@ const S = {
   mHeader:[], mRaws:[], mBase:[], mAdded:[], master:[], excluded:[], exclAoa:[], mMeta:null,
   coa:[], coaSource:'', classesUp:[], classSource:'', derived:{gls:[], classes:[]},
   txs:[], results:[], forced:new Set(), filter:'all', open:{}, drafts:{}, acks:{}, signed:null, reviewer:'', member:'',
-  dataTab:'master', mSearch:'', dl:null
+  dataTab:'master', mSearch:'', rSearch:'', dl:null, audit:{name:'', text:'', acctIdx:-1, rows:null, filter:'diff', q:'', err:''}
 };
 
 const $ = s => document.querySelector(s);
@@ -1053,6 +1109,7 @@ function renderSteps(){
     return `<button class="step ${done?'done':''}" data-view="${k}" ${S.view===k?'aria-current="page"':''}><span class="n">${done?'✓':i+1}</span>${l}${k==='resolve'&&w?`<span class="badge">${w}</span>`:''}</button>`;
   }).join('');
   $('#dataBtn').style.borderColor = S.view==='data' ? 'var(--accent)' : '';
+  $('#auditBtn').style.borderColor = S.view==='audit' ? 'var(--accent)' : '';
 }
 
 /* ---------- views ---------- */
@@ -1239,15 +1296,106 @@ function vExport(){
   ${S.signed?`<h3 style="font-size:16px;margin-top:6px">SaasAnt import preview</h3><div class="tablewrap"><table><thead><tr><th>Date</th><th>Description</th><th>Vendor</th><th>Account</th><th>Class</th><th class="r">Amount</th><th>Memo</th></tr></thead><tbody>${prev||'<tr><td colspan="7" class="empty">No rows.</td></tr>'}</tbody></table></div>`:''}`;
 }
 
+
+/* ---------- check an older, already-categorised file (read-only) ---------- */
+const AUD = {ok:['Matches','old'], diff:['Different','exception'], rule:['Rule issue','new'], unknown:['Cannot verify','bill'], scope:['Out of scope','scope']};
+function runAudit(){
+  const A = S.audit; A.err = ''; A.rows = null;
+  if(!A.text || A.acctIdx < 0) return;
+  if(!S.master.length){ A.err = 'Load the Vendor Master first (Data & rules). The check compares the file with it.'; return; }
+  try{ A.rows = Engine.audit(A.text, acctFor({acctIdx:A.acctIdx}), cfgAll(), 'a'); if(!A.rows.length) A.err = 'No transactions found. The file needs Date, DESCRIPTION, Payee and AMOUNT (or SPENT / RECEIVED) columns.'; }
+  catch(e){ A.err = 'That file could not be read: ' + (e.message || e); A.rows = null; }
+}
+function vAudit(){
+  const A = S.audit, rows = A.rows || [];
+  const c = {ok:0, diff:0, rule:0, unknown:0, scope:0}; rows.forEach(r => c[r.status]++);
+  const q = Engine.norm(A.q);
+  const shown = rows.filter(r => (A.filter==='all' || r.status===A.filter) && (!q || Engine.norm(r.payee + ' ' + r.desc + ' ' + r.file.gl + ' ' + r.sop.gl + ' ' + r.why).includes(q)));
+  const tile = (k, sub) => `<button class="tile l-${AUD[k][1]}" data-afilter="${k}" aria-pressed="${A.filter===k}"><span class="big">${c[k]}</span><span class="lbl">${AUD[k][0]}</span><span class="sub">${sub}</span></button>`;
+  const money = n => (n<0?'-':'') + Math.abs(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+  const lines = shown.slice(0, 400).map(r => `<tr><td class="nw">${esc(r.dateRaw)}</td><td>${esc(r.payee)}<div class="sub">${esc(r.desc.slice(0, 70))}</div></td><td class="r nw">${money(r.amount)}</td>
+    <td>${esc(r.file.type || '')}<div class="sub">${esc(r.file.gl || '')}${r.file.cls ? '<br>' + esc(r.file.cls) : ''}</div></td>
+    <td>${r.status==='scope'||r.status==='unknown' ? '<span class="sub">' + esc(LANE[r.sop.lane] || r.sop.lane) + '</span>' : esc(r.sop.gl || LANE[r.sop.lane] || '')}<div class="sub">${esc(r.sop.cls || '')}</div></td>
+    <td><span class="tag l-${AUD[r.status][1]}">${esc(r.label)}</span><div class="sub">${esc(r.why.slice(0, 220))}</div></td></tr>`).join('');
+  const rowsHtml = A.rows ? `
+    <div class="tiles">${tile('diff', 'GL, class or treatment differs')}${tile('rule', 'Uncategorised or reserved class')}${tile('unknown', 'New vendor or several GLs')}${tile('ok', 'Agrees with the SOP')}${tile('scope', 'Journal-entry items, not judged')}</div>
+    <div class="row"><label class="f" style="flex:1;min-width:220px">Search<input type="search" id="aSearch" value="${esc(A.q)}" placeholder="Payee, description or account"></label><button class="btn small ${A.filter==='all'?'primary':''}" data-afilter="all">Show all ${rows.length}</button><button class="btn" data-aexport="1">Save check report (Excel)</button></div>
+    <div class="tablewrap"><table><thead><tr><th>Date</th><th>Payee</th><th class="r">Amount</th><th>In the file</th><th>SOP says</th><th>Result</th></tr></thead><tbody>${lines || '<tr><td colspan="6" class="empty">Nothing in this group.</td></tr>'}</tbody></table></div>
+    ${shown.length > 400 ? `<div class="sub">Showing the first 400 of ${shown.length}. The Excel report has every row.</div>` : ''}` : '';
+  return `
+  <div class="pagehead"><div><h2>Check an older categorised file</h2><p>Upload a file that was categorised by hand (for example a QuickBooks bank feed export that shows what each line was added or matched to). Each line is run through the SOP and compared with what the file has. Nothing is posted, imported or changed.</p></div></div>
+  <div class="card" style="display:flex;flex-direction:column;gap:12px">
+    <div class="row">
+      <label class="drop" id="adrop" style="flex:1;min-width:260px;position:relative"><b>${A.name ? esc(A.name) : 'Drop the categorised file here'}</b><span class="sub">or click to choose. CSV with Date, DESCRIPTION, AMOUNT, Payee and either "ADDED OR MATCHED" or a GL account / Class column.</span><input type="file" id="auditFile" accept=".csv,text/csv" style="position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%"></label>
+      <label class="f" style="min-width:260px">Account this file came from<select data-audit-acct="1"><option value="-1">Choose account</option>${ACCOUNTS.map((a,i)=>`<option value="${i}" ${A.acctIdx===i?'selected':''}>${esc(a.num+' '+a.name)}</option>`).join('')}</select><span class="hint">Used for the bank-account class rule.</span></label>
+    </div>
+    ${A.err ? `<div class="empty"><b>${esc(A.err)}</b></div>` : ''}
+    ${!A.rows && !A.err ? '<div class="sub">Choose the file and the account. Needs the Vendor Master loaded.</div>' : ''}
+    ${rowsHtml}
+  </div>
+  <div class="sub">Limits: vendors with several GLs, new vendors and open-bill payments are listed as "Cannot verify" and never called wrong. The check is only as good as the Vendor Master.</div>`;
+}
+function auditReport(){
+  const A = S.audit, rows = A.rows || [];
+  const head = ['Result','Status','Date','Payee','Description','Amount','File: type','File: how','File: GL','File: class','SOP: lane','SOP: GL','SOP: class','Why'];
+  const aoa = [head].concat(rows.map(r => [r.label, r.status, r.dateRaw, r.payee, r.desc, r.amount, r.file.type, r.file.how, r.file.gl, r.file.cls, LANE[r.sop.lane] || r.sop.lane, r.sop.gl, r.sop.cls, r.why]));
+  const cnt = k => rows.filter(r => r.status===k).length;
+  const sum = [['Old categorised file check'], ['File', A.name], ['Checked', new Date().toLocaleString()], [], ['Different', cnt('diff')], ['Rule issue', cnt('rule')], ['Cannot verify', cnt('unknown')], ['Matches', cnt('ok')], ['Out of scope', cnt('scope')], ['Total', rows.length]];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(sum), 'Summary');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(aoa), 'All rows');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([head].concat(aoa.slice(1).filter(r => r[1]==='diff' || r[1]==='rule'))), 'To review');
+  return XLSX.write(wb, {bookType:'xlsx', type:'array'});
+}
+document.addEventListener('click', e => {
+  const f = e.target.closest('[data-afilter]'); if(f){ S.audit.filter = f.dataset.afilter; return render(); }
+  if(e.target.closest('[data-aexport]')){ try{ saveFile('Old_File_Check_' + stamp() + '.xlsx', auditReport()); }catch(err){ toast('Excel writing is not available in this view.'); } }
+  if(e.target.closest('#auditBtn')) go('audit');
+});
+document.addEventListener('change', async e => {
+  const t = e.target;
+  if(t.id==='auditFile'){ const f = t.files[0]; if(!f) return; S.audit.name = f.name; S.audit.text = await readText(f); S.audit.filter = 'diff'; S.audit.q = ''; runAudit(); t.value = ''; return render(); }
+  if(t.dataset.auditAcct){ S.audit.acctIdx = +t.value; runAudit(); return render(); }
+});
+document.addEventListener('input', e => { if(e.target.id==='aSearch'){ S.audit.q = e.target.value; render(); } });
+
 /* ---------- data & rules ---------- */
+/* The Vendor Master workbook carries Jonathan's email rules (in the GL / Notes text, e.g. "(Jonathan 9/25)") and the
+   bank-rule flag (the "Auto-match / Bank rule?" column). They are listed read-only in their tabs so the team can check them. */
+function emailRulesFromMaster(){
+  const now = new Date(), yr = now.getFullYear(), mo = now.getMonth() + 1, out = [];
+  S.master.forEach(m => {
+    if(m.src === 'new') return;
+    const parts = [m.gl, m.howTo, m.notes].join(';').split(';').map(x => x.trim()).filter(Boolean);
+    const seg = parts.filter(x => /Jonathan\s+\d{1,2}\/\d{1,2}/i.test(x)); if(!seg.length) return;
+    const d = seg[0].match(/Jonathan\s+(\d{1,2})\/(\d{1,2})/i); const mm = +d[1], dd = +d[2];
+    out.push({vendor:m.vendor, gl:m.gl, cls:m.cls, date:`${mm > mo ? yr - 1 : yr}-${pad2(mm)}-${pad2(dd)}`, note:seg.join('; ')});
+  });
+  return out.sort((a, b) => b.date.localeCompare(a.date) || a.vendor.localeCompare(b.vendor));
+}
+function bankRulesFromMaster(){
+  return S.master.filter(m => m.src !== 'new' && /^(yes|gl only)/i.test(m.autoMatch || '')).map(m => ({vendor:m.vendor, gl:m.gl, cls:m.cls, status:m.autoMatch, tier:m.tier}));
+}
+function masterRuleSection(tab){
+  if(!S.master.length) return '<div class="empty"><b>No Vendor Master loaded.</b>Upload it above to see the rules it contains.</div>';
+  const isE = tab === 'emailRules', all = isE ? emailRulesFromMaster() : bankRulesFromMaster();
+  const q = Engine.norm(S.rSearch), rows = all.filter(r => !q || Engine.norm(r.vendor).includes(q) || Engine.norm(r.gl).includes(q) || Engine.norm(r.cls).includes(q) || Engine.norm(r.note || r.status || '').includes(q));
+  const head = isE ? '<th>Vendor</th><th>GL account</th><th>Class</th><th>Email date</th><th>Instruction (from the Vendor Master)</th>' : '<th>Vendor</th><th>GL account</th><th>Class</th><th>Bank rule / auto-match</th><th>Tier</th>';
+  const body = rows.map(r => isE ? `<tr><td>${esc(r.vendor)}</td><td>${esc(r.gl)}</td><td>${esc(r.cls)}</td><td>${esc(showDate(r.date))}</td><td class="sub">${esc(r.note)}</td></tr>` : `<tr><td>${esc(r.vendor)}</td><td>${esc(r.gl)}</td><td>${esc(r.cls)}</td><td>${esc(r.status)}</td><td><span class="tag">${esc((r.tier||'').split('.')[0])}</span></td></tr>`).join('');
+  const sub = isE ? 'Jonathan\'s instructions already built into the Vendor Master. Read-only here; to change one, edit the Vendor Master or add a newer dated row above (a newer row wins).' : 'Vendors the Vendor Master marks for a bank rule / auto-match ("Yes", "Yes - limited history" = fewer than 3 past transactions, "GL only" = GL fixed, class from the waterfall). Read-only here; vendors marked "No" are not listed.';
+  return `<h3 style="font-size:15px;margin:6px 0 0">From the Vendor Master (${all.length})</h3><p class="sub" style="margin:0">${sub}</p>
+    <div class="row"><label class="f" style="flex:1;min-width:220px">Search<input type="search" id="rSearch" value="${esc(S.rSearch)}" placeholder="Vendor, account or class"></label><span class="sub">${rows.length} shown</span></div>
+    <div class="tablewrap" style="max-height:480px;overflow:auto"><table><thead><tr>${head}</tr></thead><tbody>${body || '<tr><td colspan="5" class="empty">No match.</td></tr>'}</tbody></table></div>`;
+}
+
 const TABLES = {
   emailRules:{label:'Jonathan email rules', cols:[['vendor','Vendor'],['gl','GL account'],['cls','Class'],['date','Email date','date'],['note','Note']], blank:{vendor:'',gl:'',cls:'',date:'',note:''}, help:'Every instruction Jonathan gives by email, dated. Check new emails that are not logged yet before you upload. The most recent email wins over the Vendor Master and bank rules.'},
   bankRules:{label:'Bank rules', cols:[['contains','Description contains'],['vendor','Vendor'],['gl','GL account'],['cls','Class']], blank:{contains:'',vendor:'',gl:'',cls:''}, help:'A rule fires only when the description text and the vendor both match. A description-only match is held as a possible misfire.'},
-  openBills:{label:'Open bills', cols:[['vendor','Vendor'],['amount','Amount','number'],['date','Bill date','date'],['bucket','Aging bucket'],['no','Bill no.']], blank:{vendor:'',amount:0,date:'',bucket:'',no:''}, help:'Open bills in QuickBooks. A payment for the same vendor and amount goes to the Bill Payments List instead of being categorised. Upload the A/P Aging report above, or add rows here.'},
+  openBills:{label:'Open bills', cols:[['vendor','Vendor'],['amount','Amount','number'],['date','Bill date','date'],['bucket','Aging bucket'],['no','Bill no.']], blank:{vendor:'',amount:0,date:'',bucket:'',no:''}, help:'Open bills in QuickBooks. A payment for the same vendor and amount goes to the Bill Payments List instead of being categorised. The A/P Aging Summary has no bill dates, so its Bill date stays empty and the due window is worked out from the "As of" date and the age bucket. For exact bill dates and bill numbers upload the A/P Aging Detail report.'},
   payrollMap:{label:'Payroll (non-US)', cols:[['name','Employee (exact QBO vendor name)'],['cls','Class']], blank:{name:'',cls:''}, help:'From Louise Petrie\'s payroll Excel (SOP 4.1 Step 3). A payroll entry for a listed employee takes this class instead of being held. Upload the Excel, or add rows by hand.'},
   newVendorLog:{label:'New Vendor Log', cols:[['vendor','Vendor'],['gl','Proposed GL'],['cls','Proposed class'],['date','Coded on','date'],['by','Coded by'],['status','Status']], blank:{vendor:'',gl:'',cls:'',date:'',by:'',status:'proposed'}, help:'Filled automatically when a new vendor is confirmed. Stays "proposed" until it appears in the weekly send to Jonathan and is not challenged.'}
 };
-const EMPTY = {payrollMap:'<b>No payroll classes loaded.</b>Upload Louise Petrie\'s payroll Excel. Until then, payroll entries on a non-US class are held for a person to confirm.', emailRules:'<b>Optional. Jonathan\'s confirmed email rules are already inside the Vendor Master.</b>Use this list only for new emails received after the Vendor Master was built. A newer email here overrides the Vendor Master.', bankRules:'<b>Optional. Bank rules are already inside the Vendor Master</b> (Auto-match / Bank rule column).Add rules here only for extra bank rules that are not in the Vendor Master.', openBills:'<b>No open bills loaded.</b>Upload the QBO A/P Aging report above each day. Until then, vendors with recent bills are held as New.', newVendorLog:'<b>Empty until you confirm a new vendor.</b>Each new vendor you confirm on the Resolve step is added here automatically.'};
+const EMPTY = {payrollMap:'<b>No payroll classes loaded.</b>Upload Louise Petrie\'s payroll Excel. Until then, payroll entries on a non-US class are held for a person to confirm.', emailRules:'<b>None added yet.</b>Add only emails received after the Vendor Master was built. A newer dated row here overrides the Vendor Master.', bankRules:'<b>None added yet.</b>Add only extra bank rules that are not in the Vendor Master.', openBills:'<b>No open bills loaded.</b>Upload the QBO A/P Aging report above each day. Until then, vendors with recent bills are held as New.', newVendorLog:'<b>Empty until you confirm a new vendor.</b>Each new vendor you confirm on the Resolve step is added here automatically.'};
 const DATA_TABS = [['master','Vendor Master'],['emailRules','Jonathan email rules'],['bankRules','Bank rules'],['openBills','Open bills'],['newVendorLog','New Vendor Log'],['payrollMap','Payroll (non-US)'],['classMap','Class map'],['other','Other rules']];
 
 function tierBreakdown(){ const c = {}; S.master.forEach(m => c[m.tier] = (c[m.tier]||0)+1); return Object.keys(TIERS).filter(t => c[t]).map(t => `<span class="tag" title="${esc(TIERS[t])}">${t} ${c[t]}</span>`).join(' '); }
@@ -1280,8 +1428,10 @@ function vData(){
   } else {
     const T = TABLES[tab]; const list = S.cfg[tab];
     const head = T.cols.map(c => `<th>${c[1]}</th>`).join('') + '<th></th>';
-    const rws = list.map((row, i) => `<tr>${T.cols.map(([k,,ty]) => `<td><input type="${ty||'text'}" ${ty==='number'?'step="0.01"':''} data-r="${i}" data-k="${k}" value="${esc(row[k])}"></td>`).join('')}<td><button class="btn small ghost" data-del="${i}">Remove</button></td></tr>`).join('');
-    body = `<p class="sub" style="margin:0">${T.help}</p><div class="tablewrap"><table><thead><tr>${head}</tr></thead><tbody>${rws||`<tr><td colspan="${T.cols.length+1}" class="empty">${EMPTY[tab]||'Empty.'}</td></tr>`}</tbody></table></div><div class="row"><button class="btn" data-add="1">Add row</button>${tab==='emailRules'||tab==='bankRules'||tab==='payrollMap'?up('imp-'+tab,'Import CSV / Excel','.xlsx,.xls,.csv'):''}</div>`;
+    const rws = list.map((row, i) => `<tr>${T.cols.map(([k,,ty]) => `<td><input type="${ty||'text'}" ${ty==='number'?'step="0.01"':''} data-r="${i}" data-k="${k}" value="${esc(ty==='date' ? normDate(row[k]) : row[k])}"></td>`).join('')}<td><button class="btn small ghost" data-del="${i}">Remove</button></td></tr>`).join('');
+    const withRules = tab==='emailRules' || tab==='bankRules';
+    const buttons = `<div class="row"><button class="btn" data-add="1">Add row</button>${tab==='emailRules'||tab==='bankRules'||tab==='payrollMap'?up('imp-'+tab,'Import CSV / Excel','.xlsx,.xls,.csv'):''}</div>`;
+    body = `<p class="sub" style="margin:0">${T.help}</p>${buttons}${withRules?`<h3 style="font-size:15px;margin:6px 0 0">Added by the team (${list.length})</h3>`:''}<div class="tablewrap"><table><thead><tr>${head}</tr></thead><tbody>${rws||`<tr><td colspan="${T.cols.length+1}" class="empty">${EMPTY[tab]||'Empty.'}</td></tr>`}</tbody></table></div>${withRules?masterRuleSection(tab):''}`;
   }
   return `
   <div class="pagehead"><div><h2>Data &amp; rules</h2><p>The inputs the SOP names: Vendor Master, chart of accounts, classes, open bills, Jonathan's email rules and the bank rules. Upload each once. They are saved for the whole team when team storage is on (see the badge at the top), otherwise in this browser only.</p></div></div>
@@ -1292,12 +1442,12 @@ function vData(){
 
 function render(){
   renderSteps();
-  const v = {upload:vUpload, results:vResults, resolve:vResolve, review:vReview, export:vExport, data:vData}[S.view] || vUpload;
+  const v = {upload:vUpload, results:vResults, resolve:vResolve, review:vReview, export:vExport, data:vData, audit:vAudit}[S.view] || vUpload;
   const y = window.scrollY;
   const focus = document.activeElement && document.activeElement.id;
   $('#app').innerHTML = v();
   window.scrollTo(0, y);
-  if(focus==='mSearch'){ const el = $('#mSearch'); if(el){ el.focus(); el.setSelectionRange(el.value.length, el.value.length); } }
+  if(focus==='mSearch'||focus==='rSearch'||focus==='aSearch'){ const el = $('#'+focus); if(el){ el.focus(); el.setSelectionRange(el.value.length, el.value.length); } }
 }
 function go(v){ S.view = v; render(); window.scrollTo(0, 0); }
 
@@ -1356,27 +1506,65 @@ async function importClasses(f){
   if(!out.length) throw new Error('No classes found.');
   S.classesUp = out.sort((a,b) => a.localeCompare(b)); S.classSource = 'upload'; saveAll(); toast(`Classes loaded: ${out.length}`);
 }
+const pad2 = n => String(n).padStart(2, '0');
+function normDate(v){
+  if(v == null || v === '') return '';
+  if(v instanceof Date && !isNaN(v)) return v.toISOString().slice(0, 10);
+  if(typeof v === 'number'){ if(v > 20000 && v < 80000) return new Date(Date.UTC(1899, 11, 30) + Math.round(v) * 864e5).toISOString().slice(0, 10); return ''; }
+  const t = String(v).trim(); let m;
+  if(!t) return '';
+  if(m = t.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/)) return `${m[1]}-${pad2(m[2])}-${pad2(m[3])}`;
+  if(m = t.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/)){ let y = +m[3]; if(y < 100) y += 2000; return `${y}-${pad2(m[1])}-${pad2(m[2])}`; }
+  const p = Date.parse(t + ' UTC'); return isNaN(p) ? '' : new Date(p).toISOString().slice(0, 10);
+}
+const showDate = iso => { const m = String(iso||'').match(/^(\d{4})-(\d{2})-(\d{2})$/); return m ? `${m[2]}/${m[3]}/${m[1]}` : String(iso||''); };
 async function importBills(f){
   const {sheets, names} = await readSheets(f); const aoa = sheets[names[0]];
   const out = [];
+  const BK = /^(current|\d+\s*-\s*\d+|\d+\s*(and|\+)\s*over|\d+\s*\+)$/i;
   const ag = aoa.findIndex(r => r.some(c => /^current$/i.test(String(c).trim())) && r.some(c => /^1\s*-\s*30$/.test(String(c).trim())));
   if(ag >= 0){
-    /* A/P Aging Summary: one row per vendor, one column per age bucket. No bill numbers, so each bucket
-       and the vendor total become open-balance entries and the vendor match does the work. */
+    /* A/P Aging Summary: one row per vendor, one column per age bucket. The report carries no bill dates or numbers,
+       so each bucket and the vendor total become open-balance entries; the due-date window is worked out from the
+       "As of" date and the bucket so the team can still see how old the balance is. */
+    let asOf = null;
+    aoa.slice(0, ag).forEach(r => r.forEach(c => { const m = String(c).match(/^as of\s+(.+)$/i); if(m){ const t = Date.parse(m[1].trim() + ' UTC'); if(!isNaN(t)) asOf = t; } }));
+    const fmt = t => { const d = new Date(t); return `${pad2(d.getUTCMonth()+1)}/${pad2(d.getUTCDate())}/${d.getUTCFullYear()}`; };
+    const win = h => {
+      if(asOf == null) return '';
+      let m;
+      if(/^current$/i.test(h)) return `due ${fmt(asOf)} or later`;
+      if(m = h.match(/^(\d+)\s*-\s*(\d+)$/)) return `due ${fmt(asOf - m[2]*864e5)} to ${fmt(asOf - m[1]*864e5)}`;
+      if(m = h.match(/^(\d+)/)) return `due ${fmt(asOf - m[1]*864e5)} or earlier`;
+      return '';
+    };
     const H = aoa[ag].map(c => String(c).trim());
     const bIx = H.map((h,i) => /^(current|\d+\s*-\s*\d+|\d+\s*and over)$/i.test(h) ? i : -1).filter(i => i >= 0);
     aoa.slice(ag + 1).forEach(r => {
       const v = String(r[0] || '').trim(); if(!v || /^total/i.test(v) || /GMT[+-]\d/.test(v)) return;
       let total = 0;
-      bIx.forEach(i => { const a = Engine.money(r[i]); if(a){ total += a; out.push({vendor:v, amount:a, date:'', bucket:H[i] + (/^\d+\s*-\s*\d+$/.test(H[i])?' days':''), no:''}); } });
+      bIx.forEach(i => { const a = Engine.money(r[i]); if(a){ total += a; const w = win(H[i]); out.push({vendor:v, amount:a, date:'', bucket:H[i] + (/^\d+\s*-\s*\d+$/.test(H[i])?' days':'') + (w ? ' (' + w + ')' : ''), no:''}); } });
       total = Math.round(total * 100) / 100;
       if(total && out.filter(o => o.vendor===v).length > 1) out.push({vendor:v, amount:total, date:'', bucket:'total', total:true, no:''});
     });
   } else {
-    const h = headerRow(aoa, ['vendor']); if(h < 0) throw new Error('Could not find a Vendor column or an A/P aging layout.');
+    /* A/P Aging Detail (or any bill list): one line per bill, with its bill date, due date and number.
+       QuickBooks groups the lines under age headings ("1 - 30", "Total for 1 - 30"): remember the heading as the bucket. */
+    const h = aoa.findIndex((r, i) => i < 40 && r.some(c => /^vendor( name)?$/i.test(String(c).trim())) && r.some(c => /(open balance|balance|amount)/i.test(String(c))));
+    if(h < 0) throw new Error('Could not find a Vendor column or an A/P aging layout.');
     const H = aoa[h].map(x => String(x).toLowerCase().trim());
-    const iV = colIx(H, 'vendor'), iA = colIx(H, 'open balance', 'balance', 'amount'), iD = colIx(H, 'due date', 'bill date', 'date'), iN = colIx(H, 'num', 'bill no', 'ref');
-    aoa.slice(h + 1).forEach(r => { const v = String(r[iV] || '').trim(); const a = Engine.money(r[iA]); if(v && a && !/^total/i.test(v)) out.push({vendor:v, amount:a, date:String(r[iD]||''), no:iN>=0?String(r[iN]||''):''}); });
+    const iV = H.findIndex(x => /^vendor( name)?$/.test(x)), iA = colIx(H, 'open balance', 'balance', 'amount');
+    let iB = H.findIndex(x => x === 'date' || x === 'bill date' || x === 'transaction date'); const iD = H.findIndex(x => x === 'due date');
+    if(iB < 0) iB = iD;
+    const iN = colIx(H, 'num', 'bill no', 'ref');
+    let bucket = '';
+    aoa.slice(h + 1).forEach(r => {
+      const first = String(r[0] || '').trim(), rest = r.slice(1).every(c => String(c).trim() === '');
+      if(rest && BK.test(first)){ bucket = first + (/^\d+\s*-\s*\d+$/.test(first) ? ' days' : ''); return; }
+      const v = String(r[iV] || '').trim(); const a = Engine.money(r[iA]);
+      if(!v || !a || /^total/i.test(v) || /^total/i.test(first)) return;
+      out.push({vendor:v, amount:a, date:normDate(iB >= 0 ? r[iB] : '') || normDate(iD >= 0 ? r[iD] : ''), bucket, no:iN >= 0 ? String(r[iN]||'') : ''});
+    });
   }
   if(!out.length) throw new Error('No open bills found.');
   S.cfg.openBills = out; S.cfg.noOpenBills = false; S.cfg.billsAt = today(); saveAll(); rerun(); toast(`Open bills loaded: ${new Set(out.map(o=>o.vendor)).size} vendors`);
@@ -1530,7 +1718,7 @@ document.addEventListener('click', e => {
   if(d.saveList) return doExport(d.saveList);
   if(d.export) return doExport(d.export);
   if(d.force){ S.forced.add(d.force); rerun(); toast('Moved into categorisation'); return render(); }
-  if(d.dtab){ S.dataTab = d.dtab; return render(); }
+  if(d.dtab){ S.dataTab = d.dtab; S.rSearch = ''; return render(); }
   if(d.feedDel){ S.feeds = S.feeds.filter(f => String(f.id)!==d.feedDel); return render(); }
   if(d.add){ S.cfg[S.dataTab].push(Object.assign({}, TABLES[S.dataTab].blank)); saveAll(); return render(); }
   if(d.del!==undefined){ S.cfg[S.dataTab].splice(+d.del, 1); saveAll(); rerun(); return render(); }
@@ -1555,6 +1743,7 @@ document.addEventListener('input', e => {
   const t = e.target;
   if(t.id==='member'){ S.member = t.value; return; }
   if(t.id==='mSearch'){ S.mSearch = t.value; return render(); }
+  if(t.id==='rSearch'){ S.rSearch = t.value; return render(); }
   if(t.id==='reviewer'){ S.reviewer = t.value; const b = $('#signBtn'); if(b){ b.disabled = !(waiting().length===0 && allFlags().every(f=>S.acks[f.id]) && S.reviewer.trim() && batch().length); } return; }
   if(t.dataset.filterGl){
     const q = t.value.toLowerCase(), sel = t.closest('.glrow').querySelector('select');
@@ -1587,9 +1776,9 @@ document.addEventListener('change', async e => {
   if(t.id==='imp-payrollMap') return doImport(importPayroll, t);
   if(t.id && t.id.startsWith('imp-')) return doImport(f => importTable(t.id.slice(4), f), t);
 });
-document.addEventListener('dragover', e => { const z = e.target.closest('#drop'); if(z){ e.preventDefault(); z.classList.add('over'); } });
-document.addEventListener('dragleave', e => { const z = e.target.closest('#drop'); if(z) z.classList.remove('over'); });
-document.addEventListener('drop', async e => { const z = e.target.closest('#drop'); if(z){ e.preventDefault(); z.classList.remove('over'); await addFeeds([...e.dataTransfer.files].filter(f => /\.csv$/i.test(f.name))); } });
+document.addEventListener('dragover', e => { const z = e.target.closest('#drop,#adrop'); if(z){ e.preventDefault(); z.classList.add('over'); } });
+document.addEventListener('dragleave', e => { const z = e.target.closest('#drop,#adrop'); if(z) z.classList.remove('over'); });
+document.addEventListener('drop', async e => { const z = e.target.closest('#drop,#adrop'); if(z && z.id==='adrop'){ e.preventDefault(); z.classList.remove('over'); const f = [...e.dataTransfer.files][0]; if(f){ S.audit.name = f.name; S.audit.text = await readText(f); S.audit.filter = 'diff'; S.audit.q = ''; runAudit(); render(); } return; } if(z){ e.preventDefault(); z.classList.remove('over'); await addFeeds([...e.dataTransfer.files].filter(f => /\.csv$/i.test(f.name))); } });
 
 loadAll(); render();
 cloudStart();

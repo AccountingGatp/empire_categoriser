@@ -747,7 +747,7 @@ const Engine = (() => {
         const conf = isConfirmed(r), f = eff(r);
         return { id: r.id, date: r.date, dateRaw: r.dateRaw, desc: r.desc, vendor: f.vendor, gl: f.gl, cls: f.cls, amount: r.amount,
           account: r.account ? r.account.name : '', accNum: r.account ? r.account.num : '', accCard: !!(r.account && r.account.card), cur: r.account ? r.account.cur : '', topGl: conf ? 0 : (r.topGl || 0),
-          memo: conf ? 'Confirmed by ' + (r.resolved.by || 'team member') : 'Auto: ' + r.source,
+          memo: conf ? 'Confirmed by ' + (r.resolved.by || 'team member') + (r.resolved.loc ? ' | Location: ' + r.resolved.loc.replace(/_/g, ' ') : '') : 'Auto: ' + r.source,
           adminReview: conf ? isAdminClass(f.cls) : !!r.adminReview,
           newVendor: !!r.newVendor, limited: !!r.limited, steven: !!r.steven, lane: r.lane };
       });
@@ -1270,13 +1270,13 @@ function vResolve(){
     const suggestGl = [r.suggestedGL, ...(r.suggestGls||[])].filter(Boolean);
     const head = `<div class="rc-head"><div style="min-width:0"><span class="chip l-${ok?'old':r.lane}">${ok?'Confirmed':(r.lane==='exception'&&r.exKind?EXK[r.exKind]:LANE[r.lane])}</span> ${chipsFor(r)}<div class="sub" style="margin-top:6px">${esc(r.dateRaw)} · ${esc(r.account.num)} · ${esc(r.desc)}</div></div><div class="amt num ${r.amount>0?'in':''}">${fmtR(r)}</div></div>`;
     let body;
-    if(held) body = `<div class="sub"><b>Held.</b> Only the Reviewer and Jonathan can release this row. It goes in the weekly note and stays out of the import file.${r.exKind==='steven'?' It also appears on the Steven personal mirror JE list.':''}</div>`;
-    else if(ok) body = `<div class="row"><span><b>${esc(r.resolved.vendor)}</b> → ${esc(r.resolved.gl)} · ${esc(r.resolved.cls)}</span><button class="btn small ghost" data-undo="${r.id}">Undo</button></div>`;
+    if(held) body = `<div class="sub"><b>Held.</b> Only the Reviewer and Jonathan can release this row. It stays out of the import file.${r.exKind==='steven'?' It also appears on the Steven personal mirror JE list.':''}</div>`;
+    else if(ok) body = `<div class="row"><span><b>${esc(r.resolved.vendor)}</b> → ${esc(r.resolved.gl)} · ${esc(r.resolved.cls)}${r.resolved.loc?` · <span class="sub">${esc(r.resolved.loc.replace(/_/g,' '))}</span>`:''}</span><button class="btn small ghost" data-undo="${r.id}">Undo</button></div>`;
     else {
       const sim = (r.suggest||[]).map((s,i) => `<button class="pick" data-pick-vendor="${r.id}" data-i="${i}">${esc(s.vendor)} <span class="sub">tier ${esc(s.tier)}</span></button>`).join('');
       const gls = suggestGl.map((g,i) => `<button class="pick" data-pick-gl="${r.id}" data-g="${esc(g)}">${esc(g)}</button>`).join('');
       body = `${sim?`<div class="picks"><span class="lbl">Existing vendors that may match:</span>${sim}</div>`:''}
-      ${r.payout?`<label class="f">Which location's report was this payout downloaded from?<select data-d="${r.id}" data-k="loc"><option value="">Choose the location</option>${payoutLocs().map(l=>`<option value="${esc(l.name)}" ${d.loc===l.name?'selected':''}>${esc(l.name.replace(/_/g,' '))}${l.personal?' (Steven personal book)':''}</option>`).join('')}</select><span class="hint">${d.loc&&payoutLocs().find(l=>l.name===d.loc&&l.personal)?'This location is one of Steven\'s personal properties. Confirming sends it to his personal book, not to the Empire import.':'The class is filled in from the confirmed table in SOP 13.6. Change it if the report says otherwise.'}</span></label>`:''}
+      ${r.payout?`<label class="f">Which location's report was this payout downloaded from?<select data-d="${r.id}" data-k="loc"><option value="">Choose the location</option>${payoutLocs().map(l=>`<option value="${esc(l.name)}" ${d.loc===l.name?'selected':''}>${esc(l.name.replace(/_/g,' '))}${l.personal?' (Steven personal book)':''}</option>`).join('')}</select>${(()=>{ if(d.loc||!d.cls) return ''; const m=payoutLocs().filter(l=>!l.personal&&l.cls===d.cls); return m.length?`<span class="picks"><span class="lbl">Locations that use ${esc(d.cls)}:</span>${m.map(l=>`<button type="button" class="pick" data-pick-loc="${r.id}" data-l="${esc(l.name)}">${esc(l.name.replace(/_/g,' '))}</button>`).join('')}</span>`:`<span class="hint" style="color:var(--warn,#b45309)">No Xola / Viator location posts to ${esc(d.cls)}. Choose the location the report came from.</span>`; })()}<span class="hint">${d.loc&&payoutLocs().find(l=>l.name===d.loc&&l.personal)?'This location is one of Steven\'s personal properties. Confirming sends it to his personal book, not to the Empire import.':'The class is filled in from the confirmed table in SOP 13.6. Change it if the report says otherwise.'}</span></label>`:''}
       <div class="two"><label class="f">Vendor (exact QBO name)<input type="text" list="vlist" data-d="${r.id}" data-k="vendor" value="${esc(d.vendor)}"><span class="hint">${r.account.cur==='GBP'?'Wise GBP vendors end in _G.':r.account.cur==='EUR'?'Euro vendors end in _E.':'Use the name exactly as in QBO.'}</span></label>
       <label class="f">Class${clsSelect(r.id, d.cls, r.steven)}<span class="hint">${r.proposedWhy?'Proposed from '+esc(r.proposedWhy):''}</span></label></div>
       <label class="f">GL account<div class="glrow"><input type="search" placeholder="Filter accounts" data-filter-gl="${r.id}">${glSelect(r.id, d.gl, suggestGl)}</div></label>
@@ -1319,7 +1319,6 @@ function vReview(){
 const EXPORTS = [
   ['importExp','SaasAnt import: Expenses (money out)','Your SaasAnt Expense template (Excel), plus an Expense Line Class column. Old matches plus confirmed rows. Needs sign-off.',true],
   ['importDep','SaasAnt import: Deposits (money in)','Your SaasAnt Deposit template (Excel). Old matches plus confirmed rows. Needs sign-off.',true],
-  ['combined','Combined pre-import batch','Old plus confirmed rows with the source, tier and flags the Reviewer checks.'],
   ['old','Old Transactions, Ready for Import','Rows the script matched with full confidence.'],
   ['new','New Transactions, Pending Confirmation','Rows still waiting for the Team Member.'],
   ['bill','Bill Payments List','Rows to settle with Pay Bills / Match in QuickBooks. No GL or class.'],
@@ -1345,8 +1344,6 @@ function vExport(){
   <div class="pagehead"><div><h2>Export</h2><p>${S.signed?`Signed off by ${esc(S.signed.by)}. `:'The SaasAnt file unlocks after the Reviewer signs off. Every other list can be saved any time. '}Bill payments are worked directly in QuickBooks and never go into the SaasAnt file. The two SaasAnt files use your Expense and Deposit template headers. Class is added as a last column on Expenses (the Simple template has none), so map it once in SaasAnt before the first real import (SOP section 9).</p></div>${S.signed?'':'<button class="btn" data-view="review">Go to review</button>'}</div>
   <div class="exports">
     ${EXPORTS.map(e => card(e[0], e[1], e[2], e[3])).join('')}
-    <div class="card exp"><h3>Updated Vendor Master</h3><p>Includes every new vendor confirmed so far (SOP 6.5). Upload this next time.</p><button class="btn" data-export="master" ${S.master.length?'':'disabled'}>Save Excel file (${S.master.length} vendors)</button></div>
-    <div class="card exp"><h3>Weekly note for Jonathan</h3><p>New Vendor Log, Administrative review items and exceptions, as text for email.</p><button class="btn" id="xWeekly">Copy note</button></div>
   </div>
   ${(()=>{const w=Engine.saasantSheets(rows).warn; return w.length?`<div class="banner"><span><b>Check before importing:</b><br>${w.map(esc).join('<br>')}</span></div>`:'';})()}
   ${S.signed?`<h3 style="font-size:16px;margin-top:6px">SaasAnt import preview</h3><div class="tablewrap"><table><thead><tr><th>Date</th><th>Description</th><th>Vendor</th><th>Account</th><th>Class</th><th class="r">Amount</th><th>Memo</th></tr></thead><tbody>${prev||'<tr><td colspan="7" class="empty">No rows.</td></tr>'}</tbody></table></div>`:''}`;
@@ -1483,11 +1480,14 @@ function vData(){
     <label class="f">Standard US payroll classes (one per line)<textarea data-lines="usPayrollClasses">${esc(S.cfg.usPayrollClasses.join('\n'))}</textarea><span class="hint">Payroll on any other class is held for Louise Petrie's payroll Excel (SOP 4.1 Step 3). Please confirm this list.</span></label>`;
   } else {
     const T = TABLES[tab]; const list = S.cfg[tab];
-    const head = T.cols.map(c => `<th>${c[1]}</th>`).join('') + '<th></th>';
-    const rws = list.map((row, i) => `<tr>${T.cols.map(([k,,ty]) => `<td><input type="${ty||'text'}" ${ty==='number'?'step="0.01"':''} data-r="${i}" data-k="${k}" value="${esc(ty==='date' ? normDate(row[k]) : row[k])}"></td>`).join('')}<td><button class="btn small ghost" data-del="${i}">Remove</button></td></tr>`).join('');
+    const cols = tab==='openBills' ? T.cols.filter(([k]) => (k!=='date' && k!=='no') || list.some(r => r[k])) : T.cols;
+    const head = cols.map(c => `<th>${c[1]}</th>`).join('') + '<th></th>';
+    const wide = k => tab==='openBills' && k==='bucket' ? ' style="min-width:360px"' : tab==='openBills' && k==='vendor' ? ' style="min-width:200px"' : '';
+    const rws = list.map((row, i) => `<tr>${cols.map(([k,,ty]) => `<td><input${wide(k)} type="${ty||'text'}" ${ty==='number'?'step="0.01"':''} data-r="${i}" data-k="${k}" value="${esc(ty==='date' ? normDate(row[k]) : row[k])}"></td>`).join('')}<td><button class="btn small ghost" data-del="${i}">Remove</button></td></tr>`).join('');
     const withRules = tab==='emailRules' || tab==='bankRules';
     const buttons = `<div class="row"><button class="btn" data-add="1">Add row</button>${tab==='emailRules'||tab==='bankRules'||tab==='payrollMap'?up('imp-'+tab,'Import CSV / Excel','.xlsx,.xls,.csv'):''}</div>`;
-    body = `<p class="sub" style="margin:0">${T.help}</p>${buttons}${withRules?`<h3 style="font-size:15px;margin:6px 0 0">Added by the team (${list.length})</h3>`:''}<div class="tablewrap"><table><thead><tr>${head}</tr></thead><tbody>${rws||`<tr><td colspan="${T.cols.length+1}" class="empty">${EMPTY[tab]||'Empty.'}</td></tr>`}</tbody></table></div>${withRules?masterRuleSection(tab):''}`;
+    const billSum = tab==='openBills' && list.length ? `<div class="banner"><span><b>${new Set(list.map(b=>b.vendor)).size} vendors</b> have open balances, ${list.filter(b=>!b.total).length} balance line${list.filter(b=>!b.total).length===1?'':'s'}, loaded ${esc(S.cfg.billsAt||'')}. ${list.some(b=>b.date)?'':'This is the Aging Summary, so there are no bill dates. Upload the A/P Aging Detail to get dates and bill numbers.'}</span></div>` : '';
+    body = `<p class="sub" style="margin:0">${T.help}</p>${billSum}${buttons}${withRules?`<h3 style="font-size:15px;margin:6px 0 0">Added by the team (${list.length})</h3>`:''}<div class="tablewrap"><table><thead><tr>${head}</tr></thead><tbody>${rws||`<tr><td colspan="${cols.length+1}" class="empty">${EMPTY[tab]||'Empty.'}</td></tr>`}</tbody></table></div>${withRules?masterRuleSection(tab):''}`;
   }
   return `
   <div class="pagehead"><div><h2>Data &amp; rules</h2><p>The inputs the SOP names: Vendor Master, chart of accounts, classes, open bills, Jonathan's email rules and the bank rules. Upload each once. They are saved for the whole team when team storage is on (see the badge at the top), otherwise in this browser only.</p></div></div>
@@ -1740,7 +1740,7 @@ function confirmRow(id){
   if(r.payout){
     const l = payoutLocs().find(x => x.name===dr.loc);
     if(!l) return toast('Choose the location this payout came from first.');
-    if(l.personal){ r.resolved = {confirmed:true, personal:true, vendor:dr.vendor||r.platform, gl:'Steven personal book', cls:'', by:S.member.trim(), isNewVendor:false}; S.signed = null; render(); return toast('Confirmed. This payout belongs to Steven\'s personal book and is on the Steven personal list, not the Empire import.'); }
+    if(l.personal){ r.resolved = {confirmed:true, personal:true, loc:dr.loc, vendor:dr.vendor||r.platform, gl:'Steven personal book', cls:'', by:S.member.trim(), isNewVendor:false}; S.signed = null; render(); return toast('Confirmed. This payout belongs to Steven\'s personal book and is on the Steven personal list, not the Empire import.'); }
   }
   if(!dr.vendor.trim() || !dr.gl.trim() || !dr.cls.trim()) return toast('Vendor, GL account and class are all required.');
   if(Engine.isOwnerClass(dr.cls) && !r.steven) return toast('"Owner Distribution" is not used for Empire transactions. Steven personal charges are handled by the Vendor Master rule.');
@@ -1748,7 +1748,7 @@ function confirmRow(id){
   const vend = dr.vendor.trim();
   if(!r.payout && !r.steven && !S.mHeader.length && !S.master.some(m => Engine.norm(m.vendor)===Engine.norm(vend))) return toast('Load the Vendor Master first, so a new vendor can be added to it.');
   const isNew = !r.payout && !r.steven && !S.master.some(m => Engine.norm(m.vendor)===Engine.norm(vend));
-  r.resolved = {confirmed:true, vendor:vend, gl:dr.gl.trim(), cls:dr.cls.trim(), by:S.member.trim(), isNewVendor:isNew};
+  r.resolved = {confirmed:true, vendor:vend, gl:dr.gl.trim(), cls:dr.cls.trim(), by:S.member.trim(), isNewVendor:isNew, loc:r.payout?dr.loc:''};
   let extra = 0;
   if(isNew){
     const ix = Engine.masterIndex([S.mHeader]); const raw = new Array(S.mHeader.length).fill('');
@@ -1769,7 +1769,7 @@ function confirmRow(id){
 }
 
 document.addEventListener('click', e => {
-  const t = e.target.closest('[data-view],[data-filter],[data-open],[data-confirm],[data-undo],[data-add],[data-del],[data-dtab],[data-export],[data-save-list],[data-force],[data-goto-data],[data-pick-vendor],[data-pick-gl],[data-clear],[data-nobills],[data-feed-del],button');
+  const t = e.target.closest('[data-view],[data-filter],[data-open],[data-confirm],[data-undo],[data-add],[data-del],[data-dtab],[data-export],[data-save-list],[data-force],[data-goto-data],[data-pick-vendor],[data-pick-loc],[data-pick-gl],[data-clear],[data-nobills],[data-feed-del],button');
   if(!t) return;
   const d = t.dataset;
   if(d.view) return go(d.view);
@@ -1786,6 +1786,7 @@ document.addEventListener('click', e => {
   if(d.clear){ if(d.clear==='coa'){ S.coa = []; S.coaSource = ''; rerun(); } else { S.classesUp = []; S.classSource = ''; } saveAll(); return render(); }
   if(d.nobills){ S.cfg.noOpenBills = !S.cfg.noOpenBills; if(S.cfg.noOpenBills){ S.cfg.openBills = []; } saveAll(); rerun(); return render(); }
   if(d.undo){ const r = S.results.find(x => x.id===d.undo); r.resolved = null; S.signed = null; return render(); }
+  if(d.pickLoc){ const l = payoutLocs().find(x=>x.name===d.l); const dr = S.drafts[d.pickLoc]; dr.loc = d.l; if(l && !l.personal && l.cls) dr.cls = l.cls; return render(); }
   if(d.confirm) return confirmRow(d.confirm);
   if(d.pickVendor){
     const r = S.results.find(x => x.id===d.pickVendor), s = r.suggest[+d.i], dr = S.drafts[r.id], card = t.closest('.rc');
@@ -1816,7 +1817,7 @@ document.addEventListener('input', e => {
 });
 document.addEventListener('change', async e => {
   const t = e.target, d = t.dataset;
-  if(d.d && t.tagName==='SELECT'){ S.drafts[d.d][d.k] = t.value; if(d.k==='loc'){ const l = payoutLocs().find(x => x.name===t.value); S.drafts[d.d].cls = l && !l.personal ? l.cls : ''; render(); } return; }
+  if(d.d && t.tagName==='SELECT'){ S.drafts[d.d][d.k] = t.value; if(d.k==='cls'){ const rr = S.results.find(x=>x.id===d.d); if(rr&&rr.payout){ const m = payoutLocs().filter(l=>!l.personal&&l.cls===t.value); S.drafts[d.d].loc = m.length===1 ? m[0].name : ''; render(); return; } } if(d.k==='loc'){ const l = payoutLocs().find(x => x.name===t.value); S.drafts[d.d].cls = l && !l.personal ? l.cls : ''; render(); } return; }
   if(d.ack!==undefined){ S.acks[d.ack] = t.checked; S.signed = null; return render(); }
   if(d.feedAcct){ const f = S.feeds.find(x => String(x.id)===d.feedAcct); f.acctIdx = +t.value; if(f.acctIdx >= 0) f.count = Engine.loadFeed(f.text, acctFor(f), 'x').length; return render(); }
   if(d.acls!==undefined){ S.cfg.classOverrides[d.acls] = t.value; saveAll(); if(S.feeds.length) rerun(); toast('Saved'); return; }

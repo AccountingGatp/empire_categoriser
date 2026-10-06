@@ -190,7 +190,17 @@ td input[type=checkbox]{width:18px;height:18px}
 const Engine = (() => {
   const RESERVED = ['wi', 'nola', 'ohio', 'pownwall', 'pownall', 'pownall llc oh', 'personal', 'not specified', 'unclassified'];
   const PERSONAL_KEYWORDS = ['cassville', 'cassiwille', 'wisconsin', 'ohio', 'nola', 'pownwall'];
-  const SCOPE_KEYWORDS = ['xola', 'viator', 'payroll', 'distribution', 'transfer'];
+  const SCOPE_KEYWORDS = ['payroll', 'transfer'];   // SOP v1.9 (2026-10-01): Xola/Viator payouts and distributions are IN scope again
+  /* SOP 13.6 confirmed Xola / Viator location -> class table (Dhwani 2026-10-01). personal = Steven's personal book, never Empire. */
+  const DEFAULT_PAYOUT_LOCATIONS = [
+    { name: 'Chicago_Discount_Tours', cls: 'Empire Tours:Chicago' }, { name: 'Chicago_Gangsters_and_Ghosts_Tours', cls: 'Empire Tours:Chicago' },
+    { name: 'Chicago_Private_Tours', cls: 'Empire Tours:Chicago' }, { name: 'Chicago_Private_Boat_Tours', cls: 'Empire Tours:Chicago:Chicago Boats' },
+    { name: 'Chicago_River_Boat_Architecture_Tours', cls: 'Empire Tours:Chicago:Chicago Boats' }, { name: 'NYC_Discount_Tours', cls: 'NYC' },
+    { name: 'NYC_Gangsters_and_Ghosts_Tours', cls: 'NYC:NYC G&G' }, { name: 'Tours_of_NYC', cls: 'NYC' }, { name: 'ToursOfNYC', cls: 'NYC' },
+    { name: 'Amsterdam_Tours', cls: 'Empire Tours:Amsterdam' }, { name: 'Austin_Tours', cls: 'Empire Tours:Austin' }, { name: 'Charleston_Tour_Company', cls: 'Empire Tours:Charleston' },
+    { name: 'Italy_Tours', cls: 'Empire Tours:Milan' }, { name: 'Washington_DC_Sightseeing_Tours', cls: 'Empire Tours:Washington DC' }, { name: 'See_It_All_Chicago_Tours_LLC', cls: 'Empire Tours:SIA' },
+    { name: 'Ohio_Cabins', cls: '', personal: true }, { name: 'Wisconsin_Lodges', cls: '', personal: true }, { name: 'NOLA', cls: '', personal: true }, { name: 'Pownwall', cls: '', personal: true }
+  ];
   const SUFFIX_RE = /(?:\s?[_\-]\s?(?:g|e|gbp|euro|eur|usd|v|cfl)|\s-\s(?:usd|gbp|eur))$/i;
   const TITLE_RE = /^(miss|mr|mrs|ms|dr)\s+/i;
   const CUR_SUFFIXES = { GBP: ['_g', '-g', '_gbp', ' _g'], EUR: ['_e', '_euro', '_eur', '-e'], USD: [''] };
@@ -415,23 +425,39 @@ const Engine = (() => {
       const g = glNumber(tx.suggestedGL);
       // "transfer" means an inter-account transfer. A WIRE TRANSFER to a named beneficiary is a payment to a third party, so it is not out of scope.
       const kw = SCOPE_KEYWORDS.find(k => (hasWord(descL, k) || hasWord(vkey, k)) && !(k === 'transfer' && /\bwire\b/.test(descL)));
-      const eq = g !== null && g >= 30000 && g < 40000;
       const conv = /(convert|conversion|exchange)/i.test(tx.desc);
+      const plat = hasWord(descL, 'xola') || hasWord(vkey, 'xola') ? 'xola' : (hasWord(descL, 'viator') || hasWord(vkey, 'viator')) ? 'viator' : '';
       const ex = tx.amount > 0 && (cfg.excluded || []).find(e => baseKey(e.vendor) === vkey && /sales clearing/i.test(e.gl || ''));
       if (conv) {
         const cur = [...new Set((tx.desc.match(/\b(USD|GBP|EUR)\b/g) || []))];
         out.lane = 'scope'; out.sub = 'conversion';
         out.reason = cur.includes('GBP') && cur.includes('EUR') ? 'Currency conversion GBP to EUR. Book the rate difference to Gain/Loss on Foreign Exchange (deposit if a gain, expense if a loss). SOP 13.4.'
           : cur.length ? `Currency conversion ${cur.join(' / ')}. A USD to GBP conversion is a straight Transfer with no GL impact. SOP 13.4.` : 'Currency conversion. Handled as a Transfer, or FX gain/loss for GBP to EUR. SOP 13.4.';
-        trace.push('Currency conversion or transfer between accounts: handled as a Transfer / FX entry, never categorised.');
+        trace.push('Currency conversion: handled as a Transfer / FX entry, never categorised.');
         return out;
       }
-      if (eq || g === 10031 || kw || ex) {
+      /* SOP 4 step 3(a), 13.6: a payout from Xola / Viator / another platform goes to its Clearing account, never revenue. The class depends on
+         WHICH location report the payout came from, which is not in the bank line, so a Team Member picks the location. */
+      if (tx.amount > 0 && (plat || ex || g === 10031 || g === 10032)) {
+        const clr = ex ? ex.gl : (plat === 'viator' || g === 10032) ? '10032 Sales Clearing Account:Viator Sales' : '10031 Sales Clearing Account:XOLA Sales';
+        const cc = coaResolve(cfg.coa, clr);
+        out.lane = 'new'; out.payout = true; out.platform = ex ? ex.vendor : (plat === 'viator' || g === 10032) ? 'Viator' : 'Xola';
+        out.gl = cc.error ? clr : cc.name; out.cls = ''; out.source = 'Platform payout rule (SOP 13.6)';
+        out.reason = `Payout from ${out.platform}. It posts to the Clearing account (${out.gl}), never to revenue. The class depends on which location's report this payout came from, so choose the location. Ohio / Wisconsin / NOLA / Pownwall payouts belong to Steven's personal book.`;
+        trace.push('Platform payout (SOP 4 step 3a): Clearing account pre-selected, location decides the class. Held for a person.');
+        return out;
+      }
+      if (plat && tx.amount < 0) {
+        out.lane = 'new'; out.platform = plat === 'viator' ? 'Viator' : 'Xola';
+        out.reason = `Money going out to ${out.platform}. A top-up or refund-reserve transfer is entered as a Transfer between accounts (SOP 13.4), anything else is a normal expense. A person decides.`;
+        trace.push('Outgoing platform payment. Held for a person.');
+        return out;
+      }
+      if (kw) {
         out.lane = 'scope';
-        out.reason = eq ? 'Equity / distribution item. Posted by journal entry, never by this import.'
-          : (g === 10031 || ex) ? 'Sales clearing item (Xola / Viator / Airbnb). Posted by journal entry, never by this import.'
-          : `Matches "${kw}". Posted by journal entry, never by this import.`;
-        trace.push('Out of scope (SOP section 1): Xola, Viator, payroll, distributions and transfers follow their own JE process.');
+        if (kw === 'transfer') { out.sub = 'transfer'; out.reason = 'Transfer between two of your own accounts. It is entered as a Transfer, never as income or an expense (SOP 4 step 3c, 13.4). Not part of the Expense / Deposit import.'; }
+        else out.reason = 'Payroll. It stays a Journal Entry process outside this bank-feed pipeline (SOP 13.3).';
+        trace.push(kw === 'transfer' ? 'Inter-account transfer: listed for a Transfer entry.' : 'Payroll: Journal Entry process, outside this pipeline.');
         return out;
       }
     }
@@ -444,7 +470,7 @@ const Engine = (() => {
     if (!rec && tx.vendor) out.suggest = suggestVendors(tx.desc + ' ' + tx.vendor, cfg.master || []).map(m => ({ vendor: m.vendor, tier: m.tier, gl: m.gl, cls: m.cls }));
 
     /* SOP step 2: open bill check, before any categorisation */
-    if (tx.amount < 0 && tx.vendor) {
+    if (tx.amount < 0 && tx.vendor && !(rec && rec.dd)) {   // Num = DD expenses are system generated, never a Bill Payment (SOP step 2)
       const bills = (cfg.openBills || []).filter(b => baseKey(b.vendor) === vkey);
       const hit = bills.find(b => b.amount > 0 && Math.abs(b.amount - Math.abs(tx.amount)) < 0.005);
       const nBills = bills.filter(b => !b.total && b.amount > 0).length;
@@ -499,9 +525,10 @@ const Engine = (() => {
       trace.push(`Vendor Master: QBO vendor "${rec.vendor}" (${found.how === 'exact' ? 'exact name' : 'matched by ' + found.how + ' for this account'}), tier ${rec.tier}.`);
       if (rec.tier === 'E') {
         if (cfg.stevenPost === false) { out.lane = 'exception'; out.exKind = 'steven'; out.reason = "Steven Garcia personal charge on an Empire account. Posting is switched off in Data & rules, so it is held. Code to Due to Shareholder - Steven Garcia with class Owner Distribution and make the mirror journal entry in Steven's personal book (SOP 13.2)."; return out; }
-        return stevenRow(out, tx, cfg, 'Steven Garcia personal charge on an Empire account (Vendor Master tier E, SOP 13.2).', trace);
+        stevenRow(out, tx, cfg, 'Steven Garcia personal charge on an Empire account (Vendor Master tier E, SOP 13.2). Tier E goes to New Transactions for a human decision, never auto-imported (SOP step 5); the account and class are pre-filled.', trace);
+        out.lane = 'new'; return out;
       }
-      if (rec.tier === 'F') { out.lane = 'exception'; out.exKind = 'reserved'; out.reason = 'History uses a class reserved for Steven personal book, or Unclassified. Never posted in Empire (SOP 13.2).'; return out; }
+      if (rec.tier === 'F') { out.lane = 'new'; out.reason = 'This vendor\'s history uses a class reserved for Steven personal book, or Unclassified (tier F). A person decides: choose a real Empire class, or route to his personal book (SOP step 5, 13.2).'; trace.push('Tier F: New Transactions.'); return out; }
       /* Tier A2, Yassine hybrid (Vendor Master sheet "Yassine Amount Map", Dhwani 2026-10-01). An open Bill of the same amount was already
          routed to the Bill Payments List above. Otherwise the payment amount decides. Only the Wise GBP record (_G) follows the map. */
       if (rec.tier === 'A2' && tx.amount < 0) {
@@ -520,11 +547,11 @@ const Engine = (() => {
         if (a === 1850 || a === 1750) return post('Building & land rent', 6);
         if (a === 32.5 || a === 34.5) { out.lane = 'bill'; out.billStatus = 'nobill'; out.reason = 'Monthly phone amount (32.50 / 34.50) is a Bill (Phone service, London). Enter the Bill, then Pay Bills / Match (Yassine amount map #7).'; trace.push('Yassine amount map #7: phone bill.'); return out; }
         if (a === 7) return hold('amountmap', 'A 7.00 payment with no memo. Exception if there is no description (Yassine amount map #4).');
-        if (a < 500) return post('Contract labor', 2, 'The map notes that 8 similar entries since the Sep 25 reclass sit in Other Business Expenses, so the Reviewer confirms the GL.');
+        if (a < 500) return post('Contract labor', 2,'');
         if (a >= 1650 && a <= 5700) return post('City Manager Salary', 5);
         return hold('amountmap', `Amount ${a.toFixed(2)} is outside the Yassine amount map (under 500, 1,650 to 5,700, or the fixed amounts). A person decides.`);
       }
-      if (rec.tier === 'D') { out.lane = 'exception'; out.exKind = 'payroll'; out.reason = 'Payroll / City Manager split is pending in QuickBooks. Never auto-coded and no bank rule (SOP 13.3).'; return out; }
+      if (rec.tier === 'D') { out.lane = 'new'; out.reason = 'Payroll / City Manager split is pending in QuickBooks (tier D). Never auto-coded and no bank rule; a person decides (SOP step 5, 13.3).'; trace.push('Tier D: New Transactions.'); return out; }
     }
 
     /* SOP step 3: bank rules (exact vendor plus description) */
@@ -688,7 +715,11 @@ const Engine = (() => {
       if (/uncategor/i.test(f.name)) { status = 'rule'; label = 'Left uncategorised'; why = 'The file has this posted to "' + f.gl + '". It still needs a real account.'; }
       else if (f.cls && isReserved(f.cls)) { status = 'rule'; label = 'Reserved class used'; why = 'Class "' + f.cls + '" is never valid in Empire QuickBooks (SOP 13.2).'; }
       else if (f.cls && isOwnerClass(f.cls) && !r.steven) { status = 'rule'; label = 'Owner Distribution class'; why = 'Owner Distribution is only for Steven personal charges (SOP 13.2).'; }
-      else if (r.lane === 'scope' || /^transfer$/i.test(f.type) || fnum === 10031 || (fnum !== null && fnum >= 30000 && fnum < 40000)) { status = 'scope'; label = 'Out of scope'; why = r.lane === 'scope' ? r.reason : 'Journal-entry item (sales clearing, equity or transfer). SOP section 1.'; }
+      else if (r.payout) {
+        if (sameGl(f, r.gl)) { status = 'ok'; label = 'Matches'; why = 'Posted to the Clearing account as the SOP says. The class depends on the location report, so only the account is checked.'; }
+        else { status = 'diff'; label = 'Different GL'; why = 'File: ' + (f.gl || '(none)') + '. SOP: payouts go to ' + r.gl + ' (SOP 13.6).'; }
+      }
+      else if (r.lane === 'scope' || /^transfer$/i.test(f.type)) { status = 'scope'; label = 'Out of scope'; why = r.lane === 'scope' ? r.reason : 'Transfer between accounts. Not part of the Expense / Deposit import.'; }
       else if (r.lane === 'exception') { status = 'unknown'; label = 'Cannot verify'; why = r.reason; }
       else if (r.lane === 'new') { status = 'unknown'; label = 'Cannot verify'; why = r.reason || 'Vendor is new or has several possible GLs.'; }
       else if (r.lane === 'bill') {
@@ -711,7 +742,7 @@ const Engine = (() => {
   const isAdminClass = c => /(^|:)administrative$/i.test(String(c || '').trim());
 
   function importRows(results) {
-    return results.filter(r => r.lane === 'old' || (canConfirm(r) && isConfirmed(r)))
+    return results.filter(r => r.lane === 'old' || (canConfirm(r) && isConfirmed(r) && !(r.resolved && r.resolved.personal)))
       .map(r => {
         const conf = isConfirmed(r), f = eff(r);
         return { id: r.id, date: r.date, dateRaw: r.dateRaw, desc: r.desc, vendor: f.vendor, gl: f.gl, cls: f.cls, amount: r.amount,
@@ -799,7 +830,7 @@ const Engine = (() => {
 
   return { audit, parseFileSide, parseCSV, csvToObjects, toCSV, loadFeed, run, importRows, checks, saasantSheets, SA_EXP, SA_DEP, parseMaster, masterIndex: masterHeader, deriveLists, buildIndex, resolveVendor, suggestVendors, coaResolve, MASTER_COLS,
     baseKey, norm, money, isReserved, isAdminClass, isOwnerClass, stevenGl, OWNER_CLASS, canConfirm, isConfirmed, eff, mapClass, isPL, glNumber, stripNum,
-    RESERVED, DEFAULT_CLASS_MAP, DEFAULT_US_PAYROLL, DEFAULT_BILL_ONLY };
+    RESERVED, DEFAULT_PAYOUT_LOCATIONS, DEFAULT_CLASS_MAP, DEFAULT_US_PAYROLL, DEFAULT_BILL_ONLY };
 })();
 if (typeof module !== 'undefined') module.exports = Engine;
 
@@ -1117,9 +1148,9 @@ const LISTS = {
   old:{label:'Old Transactions, Ready for Import', f:r => r.lane==='old' && !conf(r)},
   new:{label:'New Transactions, Pending Confirmation', f:r => r.lane==='new' && !conf(r)},
   exception:{label:'Exception Queue', f:r => r.lane==='exception' && !conf(r)},
-  steven:{label:'Steven personal, mirror JE', f:r => r.exKind==='steven' || r.steven},
-  transfers:{label:'Transfers & currency conversions', f:r => r.sub==='conversion'},
-  scope:{label:'Out of scope', f:r => r.lane==='scope'}
+  steven:{label:'Steven personal, mirror JE', f:r => r.exKind==='steven' || r.steven || !!(r.resolved && r.resolved.personal)},
+  transfers:{label:'Transfers & currency conversions', f:r => r.sub==='conversion' || r.sub==='transfer'},
+  scope:{label:'Out of scope (payroll, transfers, conversions)', f:r => r.lane==='scope'}
 };
 const listRows = k => S.results.filter(LISTS[k].f);
 
@@ -1195,7 +1226,7 @@ function vResults(){
     ${w||h ? `<button class="btn primary" data-view="resolve">Resolve ${w} row${w===1?'':'s'}</button>` : `<button class="btn primary" data-view="review">Go to review</button>`}</div>
   <div class="banner"><span><b>${S.feeds.length} file${S.feeds.length===1?'':'s'}</b> · ${S.txs.length} transactions · ${S.master.length} vendors in the Vendor Master</span><button class="btn small" data-view="upload">Upload different files</button></div>
   ${mWarn}${billsWarn}
-  <div class="tiles">${t('bill','Pay Bills / Match in QBO')}${t('old','Straight into the import')}${t('new','Team member decides')}${t('exception','Held, not posted')}${t('scope','Journal entries')}</div>
+  <div class="tiles">${t('bill','Pay Bills / Match in QBO')}${t('old','Straight into the import')}${t('new','Team member decides')}${t('exception','Held, not posted')}${t('scope','Payroll, transfers')}</div>
   <div class="lists">${listChips}</div>
   <div class="row" style="justify-content:space-between"><span class="sub">${esc(LISTS[S.filter].label)}: ${rows.length} row${rows.length===1?'':'s'}</span><div class="row">${S.filter!=='all'?'<button class="btn small ghost" data-filter="all">Clear filter</button>':''}<button class="btn small" data-save-list="${S.filter}" ${rows.length?'':'disabled'}>Save this list (CSV)</button></div></div>
   <div class="tablewrap"><table><thead><tr><th>Date</th><th>Acct</th><th>Vendor / description</th><th class="r">Amount</th><th>Lane</th><th>Account / class</th></tr></thead><tbody>${body||`<tr><td colspan="6" class="empty">No rows in this list.</td></tr>`}</tbody></table></div>`;
@@ -1217,12 +1248,13 @@ function glSelect(id, value, extras){
   const opt = g => `<option value="${esc(g)}" ${g===value?'selected':''}>${esc(g)}</option>`;
   return `<select id="gl-${id}" data-d="${id}" data-k="gl"><option value="">Choose an account (${list.length} available)</option>${sugg.length?`<optgroup label="Suggested">${sugg.map(opt).join('')}</optgroup>`:''}${glGroups(list).map(([t,items]) => `<optgroup label="${esc(t)}">${items.map(opt).join('')}</optgroup>`).join('')}</select>`;
 }
-function clsSelect(id, value){
+function clsSelect(id, value, allowOwner){
   const list = classList();
-  return `<select data-d="${id}" data-k="cls"><option value="">Choose a class</option>${list.map(c=>{ const res = Engine.isReserved(c), own = Engine.isOwnerClass(c); return `<option value="${esc(c)}" ${c===value?'selected':''} ${res||own?'disabled':''}>${esc(c)}${res?' (reserved, Steven personal book)':own?' (not for Empire transactions)':''}</option>`; }).join('')}${value && !list.includes(value)?`<option value="${esc(value)}" selected>${esc(value)}</option>`:''}</select>`;
+  return `<select data-d="${id}" data-k="cls"><option value="">Choose a class</option>${list.map(c=>{ const res = Engine.isReserved(c), own = Engine.isOwnerClass(c) && !allowOwner; return `<option value="${esc(c)}" ${c===value?'selected':''} ${res||own?'disabled':''}>${esc(c)}${res?' (reserved, Steven personal book)':own?' (not for Empire transactions)':''}</option>`; }).join('')}${value && !list.includes(value)?`<option value="${esc(value)}" selected>${esc(value)}</option>`:''}</select>`;
 }
+const payoutLocs = () => S.cfg.payoutLocations || Engine.DEFAULT_PAYOUT_LOCATIONS;
 function draftFor(r){
-  if(!S.drafts[r.id]) S.drafts[r.id] = { vendor: r.qboVendor || r.vendor, gl: r.gl || '', cls: (r.cls && !/^run class/i.test(r.cls)) ? r.cls : (r.adminDefault ? (S.cfg.classMap.Administrative || Engine.DEFAULT_CLASS_MAP.Administrative) : r.proposedClass) };
+  if(!S.drafts[r.id]) S.drafts[r.id] = { vendor: r.qboVendor || r.vendor || r.platform || '', gl: r.gl || '', loc: '', cls: (r.cls && !/^run class/i.test(r.cls)) ? r.cls : (r.adminDefault ? (S.cfg.classMap.Administrative || Engine.DEFAULT_CLASS_MAP.Administrative) : r.proposedClass) };
   return S.drafts[r.id];
 }
 function vResolve(){
@@ -1244,8 +1276,9 @@ function vResolve(){
       const sim = (r.suggest||[]).map((s,i) => `<button class="pick" data-pick-vendor="${r.id}" data-i="${i}">${esc(s.vendor)} <span class="sub">tier ${esc(s.tier)}</span></button>`).join('');
       const gls = suggestGl.map((g,i) => `<button class="pick" data-pick-gl="${r.id}" data-g="${esc(g)}">${esc(g)}</button>`).join('');
       body = `${sim?`<div class="picks"><span class="lbl">Existing vendors that may match:</span>${sim}</div>`:''}
+      ${r.payout?`<label class="f">Which location's report was this payout downloaded from?<select data-d="${r.id}" data-k="loc"><option value="">Choose the location</option>${payoutLocs().map(l=>`<option value="${esc(l.name)}" ${d.loc===l.name?'selected':''}>${esc(l.name.replace(/_/g,' '))}${l.personal?' (Steven personal book)':''}</option>`).join('')}</select><span class="hint">${d.loc&&payoutLocs().find(l=>l.name===d.loc&&l.personal)?'This location is one of Steven\'s personal properties. Confirming sends it to his personal book, not to the Empire import.':'The class is filled in from the confirmed table in SOP 13.6. Change it if the report says otherwise.'}</span></label>`:''}
       <div class="two"><label class="f">Vendor (exact QBO name)<input type="text" list="vlist" data-d="${r.id}" data-k="vendor" value="${esc(d.vendor)}"><span class="hint">${r.account.cur==='GBP'?'Wise GBP vendors end in _G.':r.account.cur==='EUR'?'Euro vendors end in _E.':'Use the name exactly as in QBO.'}</span></label>
-      <label class="f">Class${clsSelect(r.id, d.cls)}<span class="hint">${r.proposedWhy?'Proposed from '+esc(r.proposedWhy):''}</span></label></div>
+      <label class="f">Class${clsSelect(r.id, d.cls, r.steven)}<span class="hint">${r.proposedWhy?'Proposed from '+esc(r.proposedWhy):''}</span></label></div>
       <label class="f">GL account<div class="glrow"><input type="search" placeholder="Filter accounts" data-filter-gl="${r.id}">${glSelect(r.id, d.gl, suggestGl)}</div></label>
       ${gls?`<div class="picks"><span class="lbl">${r.suggestGls&&r.suggestGls.length?'Accounts this vendor has used:':'QBO suggested:'}</span>${gls}</div>`:''}
       <div class="row" style="justify-content:flex-end"><button class="btn primary" data-confirm="${r.id}">Confirm</button></div>`;
@@ -1446,7 +1479,7 @@ function vData(){
     <div class="tablewrap"><table><thead><tr><th>Account</th><th>Bank decides</th></tr></thead><tbody>${ACCOUNTS.map(a => `<tr><td>${esc(a.num+' '+a.name)}</td><td><select data-acls="${a.num}"><option value="">None</option>${Object.keys(Engine.DEFAULT_CLASS_MAP).filter(k=>k!=='Administrative').map(k=>`<option value="${k}" ${(S.cfg.classOverrides[a.num] ?? a.bankClass)===k?'selected':''}>${k}</option>`).join('')}</select></td></tr>`).join('')}</tbody></table></div>`;
   } else if(tab==='other'){
     body = `<label class="f">Bill-payment-only vendor names (one per line, part of the name)<textarea data-lines="billOnlyPatterns">${esc(S.cfg.billOnlyPatterns.join('\n'))}</textarea><span class="hint">SOP 13.1: Yassine, Chicago from the Lake, Shoreline, Google Ads. The Vendor Master lists Chicago from the Lake and Shoreline as auto-match, so they are listed here to follow the SOP.</span></label>
-    <label class="check" style="display:flex;gap:10px;align-items:flex-start"><input type="checkbox" id="stevenPost" ${S.cfg.stevenPost!==false?'checked':''}><span><b>Post Steven personal charges to Due to Steven Garcia (SOP 13.2)</b><br><span class="hint">On: vendors marked personal (tier E) and descriptions with Cassville, Wisconsin, Ohio, NOLA or Pownwall go straight to the import as Due to Shareholder - Steven Garcia with class Owner Distribution (never the Ohio, NOLA or WI classes), and are listed for the mirror journal entry. Off: they are held in the Exception Queue instead.</span></span></label>
+    <label class="check" style="display:flex;gap:10px;align-items:flex-start"><input type="checkbox" id="stevenPost" ${S.cfg.stevenPost!==false?'checked':''}><span><b>Post Steven personal charges to Due to Steven Garcia (SOP 13.2)</b><br><span class="hint">On: vendors marked personal (tier E, goes to New Transactions with the account pre-filled) and descriptions with Cassville, Wisconsin, Ohio, NOLA or Pownwall go straight to the import as Due to Shareholder - Steven Garcia with class Owner Distribution (never the Ohio, NOLA or WI classes), and are listed for the mirror journal entry. Off: they are held in the Exception Queue instead.</span></span></label>
     <label class="f">Standard US payroll classes (one per line)<textarea data-lines="usPayrollClasses">${esc(S.cfg.usPayrollClasses.join('\n'))}</textarea><span class="hint">Payroll on any other class is held for Louise Petrie's payroll Excel (SOP 4.1 Step 3). Please confirm this list.</span></label>`;
   } else {
     const T = TABLES[tab]; const list = S.cfg[tab];
@@ -1663,7 +1696,7 @@ function listCSV(k){
   return Engine.toCSV([['Date','Account','Vendor','Description','Amount','Currency','Lane','GL account','Class','Tier','Reason']].concat(rows.map(r => { const c = conf(r); return [r.dateRaw, r.account.name, c?r.resolved.vendor:(r.qboVendor||r.vendor), r.desc, r.amount.toFixed(2), r.account.cur, c?'Confirmed':LANE[r.lane], c?r.resolved.gl:r.gl, c?r.resolved.cls:r.cls, r.tier, r.reason]; })));
 }
 function stevenCSV(){
-  return Engine.toCSV([['Date','Empire account','Vendor','Description','Amount','Empire book: GL','Empire book: class','Mirror JE in Steven personal book: DEBIT','Mirror JE: CREDIT','Status']].concat(listRows('steven').map(r => [r.dateRaw, r.account.name, r.qboVendor||r.vendor, r.desc, r.amount.toFixed(2), r.steven ? r.gl : 'Due to Steven Garcia (held, posting switched off)', 'Empire Tours:Owner Distribution', 'Real expense category for this charge (Reviewer to set)', 'Due to Empire', r.steven ? 'In the Empire import' : 'Held'])));
+  return Engine.toCSV([['Date','Empire account','Vendor','Description','Amount','Empire book: GL','Empire book: class','Mirror JE in Steven personal book: DEBIT','Mirror JE: CREDIT','Status']].concat(listRows('steven').map(r => [r.dateRaw, r.account.name, r.qboVendor||r.vendor, r.desc, r.amount.toFixed(2), (r.resolved&&r.resolved.personal) ? '(none, payout belongs to Steven personal book)' : r.steven ? r.gl : 'Due to Steven Garcia (held, posting switched off)', (r.resolved&&r.resolved.personal) ? '' : 'Empire Tours:Owner Distribution', (r.resolved&&r.resolved.personal) ? 'Record the payout in Steven personal QuickBooks' : 'Real expense category for this charge (Reviewer to set)', (r.resolved&&r.resolved.personal) ? '' : 'Due to Empire', (r.resolved&&r.resolved.personal) ? 'Not in the Empire import' : r.steven ? ((r.lane==='old'||conf(r)) ? 'In the Empire import' : 'Waiting for the Team Member to confirm') : 'Held'])));
 }
 function masterWorkbook(){
   const wb = XLSX.utils.book_new();
@@ -1704,12 +1737,17 @@ function weeklyNote(){
 function confirmRow(id){
   const r = S.results.find(x => x.id===id), dr = S.drafts[id];
   if(!S.member.trim()) return toast('Enter the team member name first.');
+  if(r.payout){
+    const l = payoutLocs().find(x => x.name===dr.loc);
+    if(!l) return toast('Choose the location this payout came from first.');
+    if(l.personal){ r.resolved = {confirmed:true, personal:true, vendor:dr.vendor||r.platform, gl:'Steven personal book', cls:'', by:S.member.trim(), isNewVendor:false}; S.signed = null; render(); return toast('Confirmed. This payout belongs to Steven\'s personal book and is on the Steven personal list, not the Empire import.'); }
+  }
   if(!dr.vendor.trim() || !dr.gl.trim() || !dr.cls.trim()) return toast('Vendor, GL account and class are all required.');
-  if(Engine.isOwnerClass(dr.cls)) return toast('"Owner Distribution" is not used for Empire transactions. Steven personal charges are handled by the Vendor Master rule.');
+  if(Engine.isOwnerClass(dr.cls) && !r.steven) return toast('"Owner Distribution" is not used for Empire transactions. Steven personal charges are handled by the Vendor Master rule.');
   if(Engine.isReserved(dr.cls)) return toast(`"${dr.cls}" is reserved for Steven Garcia's personal book. Choose an Empire class.`);
   const vend = dr.vendor.trim();
-  if(!S.mHeader.length && !S.master.some(m => Engine.norm(m.vendor)===Engine.norm(vend))) return toast('Load the Vendor Master first, so a new vendor can be added to it.');
-  const isNew = !S.master.some(m => Engine.norm(m.vendor)===Engine.norm(vend));
+  if(!r.payout && !r.steven && !S.mHeader.length && !S.master.some(m => Engine.norm(m.vendor)===Engine.norm(vend))) return toast('Load the Vendor Master first, so a new vendor can be added to it.');
+  const isNew = !r.payout && !r.steven && !S.master.some(m => Engine.norm(m.vendor)===Engine.norm(vend));
   r.resolved = {confirmed:true, vendor:vend, gl:dr.gl.trim(), cls:dr.cls.trim(), by:S.member.trim(), isNewVendor:isNew};
   let extra = 0;
   if(isNew){
@@ -1778,7 +1816,7 @@ document.addEventListener('input', e => {
 });
 document.addEventListener('change', async e => {
   const t = e.target, d = t.dataset;
-  if(d.d && t.tagName==='SELECT'){ S.drafts[d.d][d.k] = t.value; return; }
+  if(d.d && t.tagName==='SELECT'){ S.drafts[d.d][d.k] = t.value; if(d.k==='loc'){ const l = payoutLocs().find(x => x.name===t.value); S.drafts[d.d].cls = l && !l.personal ? l.cls : ''; render(); } return; }
   if(d.ack!==undefined){ S.acks[d.ack] = t.checked; S.signed = null; return render(); }
   if(d.feedAcct){ const f = S.feeds.find(x => String(x.id)===d.feedAcct); f.acctIdx = +t.value; if(f.acctIdx >= 0) f.count = Engine.loadFeed(f.text, acctFor(f), 'x').length; return render(); }
   if(d.acls!==undefined){ S.cfg.classOverrides[d.acls] = t.value; saveAll(); if(S.feeds.length) rerun(); toast('Saved'); return; }

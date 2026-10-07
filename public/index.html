@@ -168,6 +168,7 @@ td input[type=checkbox]{width:18px;height:18px}
 .filebtn{position:relative;overflow:hidden;display:inline-block}
 .filebtn input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%}
 
+.sopl{margin:0;padding-left:20px;display:flex;flex-direction:column;gap:6px}
 .toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:9px;box-shadow:var(--shadow);z-index:30;max-width:calc(100vw - 32px)}
 @media (max-width:900px){.tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.upgrid{grid-template-columns:1fr}.signoff{grid-template-columns:1fr}}
 @media (max-width:760px){.steps{order:3;flex:1 0 100%}.rulesbtn{margin-left:auto}.feed{grid-template-columns:1fr}}
@@ -179,6 +180,7 @@ td input[type=checkbox]{width:18px;height:18px}
   <div class="brand"><b>Empire Categoriser</b><span>Bank feed to SaasAnt</span></div>
   <nav class="steps" id="steps" aria-label="Steps"></nav>
   <span class="pill off" id="cloudPill">This browser only</span>
+  <button class="btn rulesbtn" id="sopBtn">SOP</button>
   <button class="btn rulesbtn" id="dataBtn">Data &amp; rules</button>
 </div></header>
 <main class="wrap" id="app"></main>
@@ -1193,7 +1195,7 @@ function rerun(){
   S.signed = null;
 }
 const ready = () => S.txs.length > 0;
-const counts = () => { const c = {bill:0, old:0, new:0, exception:0, scope:0}; S.results.forEach(r => c[r.lane]++); return c; };
+const counts = () => { const c = {bill:0, old:0, new:0, exception:0, scope:0}; S.results.forEach(r => { if(conf(r)) c.old++; else c[r.lane]++; }); return c; };
 const waiting = () => S.results.filter(r => r.lane === 'new' && !Engine.isConfirmed(r));
 const heldEx = () => S.results.filter(r => r.lane === 'exception' && !Engine.isConfirmed(r));
 const batch = () => Engine.importRows(S.results);
@@ -1207,7 +1209,7 @@ const LISTS = {
   bill:{label:'Bill Payments List', f:r => r.lane==='bill'},
   admin:{label:'Administrative Class Review List', f:r => (r.lane==='old' && !conf(r) && r.adminReview) || (conf(r) && Engine.isAdminClass(r.resolved.cls))},
   newvendor:{label:'New vendors', f:r => r.newVendor && r.lane!=='scope' && r.lane!=='bill'},
-  old:{label:'Old Transactions, Ready for Import', f:r => r.lane==='old' && !conf(r)},
+  old:{label:'Ready for import (rules + confirmed)', f:r => (r.lane==='old' && !conf(r)) || conf(r)},
   new:{label:'New Transactions, Pending Confirmation', f:r => r.lane==='new' && !conf(r)},
   exception:{label:'Exception Queue', f:r => r.lane==='exception' && !conf(r)},
   steven:{label:'Steven personal, mirror JE', f:r => r.exKind==='steven' || r.steven || !!(r.resolved && r.resolved.personal)},
@@ -1224,6 +1226,7 @@ function renderSteps(){
     const done = (k==='upload' && S.txs.length) || (k==='results' && S.txs.length && S.seenResolve) || (k==='resolve' && S.txs.length && w===0) || (k==='review' && S.signed);
     return `<button class="step ${done?'done':''}" data-view="${k}" ${S.view===k?'aria-current="page"':''}><span class="n">${done?'✓':i+1}</span>${l}${k==='resolve'&&w?`<span class="badge">${w}</span>`:''}</button>`;
   }).join('');
+  $('#sopBtn').style.borderColor = S.view==='sop' ? 'var(--accent)' : '';
   $('#dataBtn').style.borderColor = S.view==='data' ? 'var(--accent)' : '';
   
 }
@@ -1276,6 +1279,18 @@ function vUpload(){
   <div class="row"><button class="btn primary" id="processBtn" ${can?'':'disabled'}>Process ${S.feeds.length||''} file${S.feeds.length===1?'':'s'}</button>${S.feeds.length && !can?'<span class="sub">Choose an account for every file.</span>':''}</div>`;
 }
 
+function vSop(){
+  const st = (n, t, items) => `<div class="card"><h3 style="font-size:16px;margin-bottom:6px"><span class="chip l-old" style="margin-right:8px">Step ${n}</span>${t}</h3><ul class="sopl">${items.map(i => `<li>${i}</li>`).join('')}</ul></div>`;
+  return `
+  <div class="pagehead"><div><h2>How to use this tool</h2><p>It sorts the bank feed using the Empire categorisation SOP and builds the SaasAnt files. Follow the steps in order.</p></div><button class="btn primary" data-view="upload">Start</button></div>
+  ${st(0,'One-time setup (Data &amp; rules)',['Upload the <b>Vendor Master</b> once. Add the Chart of accounts and Classes if you have them. They are saved for the team.','Xola payouts load by themselves. Nothing to do.'])}
+  ${st(1,'Upload',['Drop one bank CSV per account. Choose the account for each file.','Upload today\'s <b>open bills</b> (QuickBooks A/P Aging report), or press <b>None today</b>.','Press <b>Process</b>.'])}
+  ${st(2,'Results',['See what the tool did with every row. Click a row to see why.','<b>Bill payments</b>: pay or match them in QuickBooks. They never go into the SaasAnt file.','<b>Ready for import</b>: matched by the rules, or already confirmed.','<b>Needs decision</b>: a person must decide. <b>Exception</b>: held for the Reviewer. <b>Out of scope</b>: payroll and transfers.'])}
+  ${st(3,'Resolve (team member)',['Open each card. Check the vendor, the account and the class. QBO\'s suggested account is already filled in.','Press <b>Confirm</b>. A new vendor is added to the Vendor Master automatically.','Xola payouts are matched to their location by amount and confirmed for you. Only unclear ones show here.','Held rows are for the Reviewer and Jonathan only.'])}
+  ${st(4,'Review (reviewer)',['Read each check flag, tick it once you have judged it, enter your name and <b>Sign off</b>.','Sign-off needs every row decided and every flag ticked.'])}
+  ${st(5,'Export',['Save the <b>SaasAnt Expense</b> and <b>Deposit</b> Excel files and import them in SaasAnt.','Save the lists you need: Bill payments, new vendors, Administrative class review, Steven personal.'])}
+  ${st('+','Review File',['On the Upload page, <b>Review File</b> checks an older, hand-categorised file against the SOP. Nothing is posted or changed.'])}`;
+}
 function chipsFor(r){
   return `${r.newVendor?'<span class="mini newv">New vendor</span> ':''}${r.steven?'<span class="mini lim">Steven personal</span> ':''}${r.tier?`<span class="mini lim">Tier ${esc(r.tier)}</span> `:''}${r.limited?'<span class="mini lim">Limited history</span> ':''}`;
 }
@@ -1583,7 +1598,7 @@ function vData(){
 
 function render(){
   renderSteps();
-  const v = {upload:vUpload, results:vResults, resolve:vResolve, review:vReview, export:vExport, data:vData, audit:vAudit}[S.view] || vUpload;
+  const v = {upload:vUpload, results:vResults, resolve:vResolve, review:vReview, export:vExport, data:vData, audit:vAudit, sop:vSop}[S.view] || vUpload;
   const y = window.scrollY;
   const focus = document.activeElement && document.activeElement.id;
   $('#app').innerHTML = v();
@@ -1932,6 +1947,7 @@ document.addEventListener('click', async e => {
   }
   if(d.pickGl){ const dr = S.drafts[d.pickGl], card = t.closest('.rc'), sel = card.querySelector('[data-k=gl]'); dr.gl = d.g; if(![...sel.options].some(o => o.value===d.g)){ const o = document.createElement('option'); o.value = d.g; o.textContent = d.g; sel.appendChild(o); } sel.value = d.g; return; }
   if(t.id==='dataBtn') return go('data');
+  if(t.id==='sopBtn') return go('sop');
   if(t.id==='processBtn'){ t.disabled = true; t.textContent = 'Working…'; if(XOLA_P || Date.now()-XOLA_AT > 20*60e3) await Promise.race([autoXola(), new Promise(r => setTimeout(r, 25000))]); process(); if(!S.txs.length) return toast('No transactions found. Check the column headers (Date, DESCRIPTION, Payee, SPENT, RECEIVED).'); S.filter = 'all'; go('results'); return toast(`Loaded ${S.txs.length} transactions from ${S.feeds.length} file${S.feeds.length===1?'':'s'}`); }
   if(t.id==='signBtn'){ S.signed = {by:S.reviewer.trim(), at:new Date().toLocaleString()}; return render(); }
 });

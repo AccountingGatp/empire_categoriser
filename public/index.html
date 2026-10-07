@@ -394,6 +394,10 @@ const Engine = (() => {
     if (/see it all/i.test(desc)) return { cls: mapClass('SIA', cfg), why: 'description contains "See It All"' };
     return null;
   }
+  /* Retired classes (Jonathan/Dhwani 2026-10-07): Chicago Private, Chicago G&G and Chicago Walking are never used. Those items are plain Chicago. */
+  const RETIRED_CLASS = /(^|:)chicago (private|g&g|walking)$/i;
+  const isRetiredClass = c => RETIRED_CLASS.test(String(c || '').trim());
+  const remapClass = c => isRetiredClass(c) ? 'Empire Tours:Chicago' : c;
   const isUsPayrollClass = (cls, cfg) => (cfg.usPayrollClasses || DEFAULT_US_PAYROLL).some(c => norm(cls) === norm(c) || norm(cls).startsWith(norm(c) + ':'));
 
   /* SOP 13.2 (confirmed by the team leader 2026-09-30): Steven personal charge on an Empire account ->
@@ -409,6 +413,23 @@ const Engine = (() => {
     out.reason = why + ' Posted to Due to Shareholder - Steven Garcia (a liability) with class Owner Distribution. The mirror journal entry goes in Steven\'s personal book (debit the real expense, credit Due to Empire).';
     trace.push('Steven personal rule: GL ' + out.gl + ', class ' + out.cls + '. Listed on the mirror JE list.');
     return out;
+  }
+
+  /* Xola payout lookup: the Payouts Report (or the Xola API) gives each location's payout total (the sum of its Net column equals the bank deposit).
+     A bank deposit is matched to those totals by amount. The location's class comes from the SOP 13.6 table. */
+  const normLoc = x => String(x || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const findLoc = (name, cfg) => (cfg.payoutLocations || DEFAULT_PAYOUT_LOCATIONS).find(l => normLoc(l.name) === normLoc(name)) || null;
+  function payoutOptions(tx, cfg) {
+    const a = Math.round(tx.amount * 100) / 100, by = new Map();
+    (cfg.payoutIndex || []).forEach(e => {
+      if (Math.abs(Math.round(Number(e.net) * 100) / 100 - a) > 0.005) return;
+      if (e.date && tx.date) { const dd = (Date.parse(tx.date) - Date.parse(e.date)) / 864e5; if (!isNaN(dd) && (dd < -1 || dd > 21)) return; }
+      const l = findLoc(e.loc, cfg);
+      const key = l ? (l.personal ? 'PERSONAL' : (l.cls || '?' + e.loc)) : '?' + e.loc;
+      if (!by.has(key)) by.set(key, { cls: l && !l.personal ? l.cls : '', personal: !!(l && l.personal), known: !!l, locs: [], dates: [] });
+      const o = by.get(key); if (!o.locs.includes(e.loc)) o.locs.push(e.loc); if (e.date && !o.dates.includes(e.date)) o.dates.push(e.date);
+    });
+    return [...by.values()];
   }
 
   /* ---------- one transaction ---------- */
@@ -441,10 +462,28 @@ const Engine = (() => {
       if (tx.amount > 0 && (plat || ex || g === 10031 || g === 10032)) {
         const clr = ex ? ex.gl : (plat === 'viator' || g === 10032) ? '10032 Sales Clearing Account:Viator Sales' : '10031 Sales Clearing Account:XOLA Sales';
         const cc = coaResolve(cfg.coa, clr);
+        const isXola = !ex && plat !== 'viator' && g !== 10032;
         out.lane = 'new'; out.payout = true; out.platform = ex ? ex.vendor : (plat === 'viator' || g === 10032) ? 'Viator' : 'Xola';
         out.gl = cc.error ? clr : cc.name; out.cls = ''; out.source = 'Platform payout rule (SOP 13.6)';
-        out.reason = `Payout from ${out.platform}. It posts to the Clearing account (${out.gl}), never to revenue. The class depends on which location's report this payout came from, so choose the location. Ohio / Wisconsin / NOLA / Pownwall payouts belong to Steven's personal book.`;
-        trace.push('Platform payout (SOP 4 step 3a): Clearing account pre-selected, location decides the class. Held for a person.');
+        const opts = isXola ? payoutOptions(tx, cfg) : [];
+        out.payoutOptions = opts;
+        const base = `Payout from ${out.platform}. It posts to the Clearing account (${out.gl}), never to revenue.`;
+        if (opts.length === 1 && !opts[0].personal && opts[0].cls) {
+          out.cls = opts[0].cls;
+          out.reason = `${base} The amount matches the Xola payout of ${opts[0].locs.join(', ')}${opts[0].dates.length ? ' (paid ' + opts[0].dates.join(', ') + ')' : ''}, so the class is ${opts[0].cls} (SOP 13.6). Confirm to add it.`;
+          trace.push('Platform payout: amount matched one Xola payout, class from the location table.');
+        } else if (opts.length === 1 && opts[0].personal) {
+          out.reason = `${base} The amount matches a payout of ${opts[0].locs.join(', ')}, a personal property of Steven Garcia. It belongs in his personal book, not the Empire import (SOP 13.6).`;
+          trace.push('Platform payout: matched a personal location (Steven).');
+        } else if (opts.length > 1) {
+          out.pickClass = true;
+          out.reason = `${base} More than one Xola location had a payout of exactly this amount (${opts.map(o => o.locs.join(', ')).join(' / ')}). Choose which one this deposit is.`;
+          trace.push('Platform payout: same amount in several locations. A person chooses the class.');
+        } else {
+          out.adminDefault = true;
+          out.reason = `${base} ${isXola ? ((cfg.payoutIndex || []).length ? 'No Xola payout of this amount was found' : 'No Xola payouts are loaded') : 'The class cannot be read from the bank line'}, so Administrative is pre-selected (SOP 4.1 Step 5) and the row goes on the Administrative Class Review List. Change it if you know the location.`;
+          trace.push('Platform payout: no location match. Administrative by default.');
+        }
         return out;
       }
       if (plat && tx.amount < 0) {
@@ -571,13 +610,13 @@ const Engine = (() => {
       if (rec.tier === 'C2') {
         out.reason = 'Vendor uses several GL accounts. Choose from the receipt or expense report. If unsure, ask (SOP 13.6).';
         out.suggestGls = [rec.gl, ...String(rec.otherGls).split(';').map(x => x.replace(/ \(\d+%\)$/, '').trim())].filter(Boolean);
-        out.cls = rec.cls && !/^run class/i.test(rec.cls) ? rec.cls : '';
+        out.cls = rec.cls && !/^run class/i.test(rec.cls) ? remapClass(rec.cls) : '';
         trace.push('Tier C2: multiple GLs. Held for a person.');
         return out;
       }
       if (rec.tier === 'C3') {
         out.reason = 'The Vendor Master has no GL for this vendor (split bills). Open the original Bill in QBO to see the real category, or check whether this is a bill payment.';
-        out.cls = rec.cls && !/^run class/i.test(rec.cls) ? rec.cls : '';
+        out.cls = rec.cls && !/^run class/i.test(rec.cls) ? remapClass(rec.cls) : '';
         trace.push('Tier C3: GL not captured. Held for a person.');
         return out;
       }
@@ -603,6 +642,7 @@ const Engine = (() => {
     }
 
     const gls = [...new Set(cands.map(c => c.gl).filter(Boolean))];
+    cands.forEach(c => { c.cls = remapClass(c.cls); });
     const clss = [...new Set(cands.map(c => c.cls).filter(Boolean))];
     if (gls.length > 1 || clss.length > 1) {
       const pick = cands.find(c => c.src === 'Email rule') || cands[0];
@@ -615,7 +655,7 @@ const Engine = (() => {
 
     /* SOP 4.1 class waterfall */
     let clsFromEmail = false;
-    if (email && email.cls) { out.cls = email.cls; clsFromEmail = true; trace.push('Class Step 1: class given in Jonathan email log.'); }
+    if (email && email.cls) { out.cls = remapClass(email.cls); clsFromEmail = true; trace.push('Class Step 1: class given in Jonathan email log.'); }
     else if (clss[0]) { out.cls = clss[0]; trace.push('Class Step 1: class held by the matched rule / Vendor Master entry.'); }
     else if (bankClass) { out.cls = bankClass; trace.push(`Class Step 2: bank account ${acct.name} maps to ${bankClass}.`); }
     else {
@@ -633,6 +673,7 @@ const Engine = (() => {
       else { out.cls = mapClass('Administrative', cfg); out.adminReview = true; trace.push('Class Step 5: nothing resolved the class. Administrative for now, added to the Administrative Class Review List.'); }
     }
 
+    out.cls = remapClass(out.cls);
     if (isReserved(out.cls)) {
       out.lane = 'exception'; out.exKind = 'reserved';
       out.reason = `Class "${out.cls}" is reserved for Steven Garcia's personal book or not allowed in Empire.`;
@@ -713,6 +754,7 @@ const Engine = (() => {
       const sop = { lane: r.lane, gl: r.gl || '', cls: r.cls || '', reason: r.reason || '' };
       let status, label, why;
       if (/uncategor/i.test(f.name)) { status = 'rule'; label = 'Left uncategorised'; why = 'The file has this posted to "' + f.gl + '". It still needs a real account.'; }
+      else if (f.cls && isRetiredClass(f.cls)) { status = 'rule'; label = 'Retired class used'; why = 'Class "' + f.cls + '" is not used. Those items are plain Chicago (Empire Tours:Chicago).'; }
       else if (f.cls && isReserved(f.cls)) { status = 'rule'; label = 'Reserved class used'; why = 'Class "' + f.cls + '" is never valid in Empire QuickBooks (SOP 13.2).'; }
       else if (f.cls && isOwnerClass(f.cls) && !r.steven) { status = 'rule'; label = 'Owner Distribution class'; why = 'Owner Distribution is only for Steven personal charges (SOP 13.2).'; }
       else if (r.payout) {
@@ -830,7 +872,7 @@ const Engine = (() => {
 
   return { audit, parseFileSide, parseCSV, csvToObjects, toCSV, loadFeed, run, importRows, checks, saasantSheets, SA_EXP, SA_DEP, parseMaster, masterIndex: masterHeader, deriveLists, buildIndex, resolveVendor, suggestVendors, coaResolve, MASTER_COLS,
     baseKey, norm, money, isReserved, isAdminClass, isOwnerClass, stevenGl, OWNER_CLASS, canConfirm, isConfirmed, eff, mapClass, isPL, glNumber, stripNum,
-    RESERVED, DEFAULT_PAYOUT_LOCATIONS, DEFAULT_CLASS_MAP, DEFAULT_US_PAYROLL, DEFAULT_BILL_ONLY };
+    RESERVED, isRetiredClass, remapClass, DEFAULT_PAYOUT_LOCATIONS, payoutOptions, normLoc, findLoc, DEFAULT_CLASS_MAP, DEFAULT_US_PAYROLL, DEFAULT_BILL_ONLY };
 })();
 if (typeof module !== 'undefined') module.exports = Engine;
 
@@ -853,7 +895,7 @@ const EXK = {novendor:'No vendor', personal:'Personal-book keyword', reserved:'R
 const TIERS = {A:'Bill-payment-only', A2:'Hybrid: bill + small expense (Yassine)', B:'Auto-match ready', C1:'GL fixed, class needs waterfall', C2:'Several GLs, ask', C3:'GL not captured, open the bill', D:'Payroll / City Manager split', E:'Steven personal', F:'Reserved class history'};
 
 const DEFAULT_CFG = () => ({
-  emailRules: [], bankRules: [], payrollMap: [], openBills: [], noOpenBills: false, billsAt: '', newVendorLog: [],
+  emailRules: [], bankRules: [], payrollMap: [], openBills: [], payoutIndex: [], noOpenBills: false, billsAt: '', newVendorLog: [],
   classOverrides: {}, classMap: Object.assign({}, Engine.DEFAULT_CLASS_MAP),
   stevenPost: true, usPayrollClasses: Engine.DEFAULT_US_PAYROLL.slice(), billOnlyPatterns: Engine.DEFAULT_BILL_ONLY.slice()
 });
@@ -919,6 +961,7 @@ const clDocs = () => {
     'team/coa': {list:S.coa, source:S.coaSource},
     'team/classes': {list:S.classesUp, source:S.classSource}
   };
+  o['team/payouts'] = {list:S.cfg.payoutIndex||[]};
   if(S.cfg.billsAt === today()) o['team/bills'] = {list:S.cfg.openBills, at:S.cfg.billsAt, none:!!S.cfg.noOpenBills};
   return o;
 };
@@ -1031,6 +1074,8 @@ function applyAll(initial){
   if(coa){ if(ss({list:S.coa, source:S.coaSource}) !== ss(coa)){ S.coa = coa.list||[]; S.coaSource = coa.source||''; changed = true; } CL.last['team/coa'] = ss({list:S.coa, source:S.coaSource}); }
   const cls = S1['team/classes'];
   if(cls){ if(ss({list:S.classesUp, source:S.classSource}) !== ss(cls)){ S.classesUp = cls.list||[]; S.classSource = cls.source||''; changed = true; } CL.last['team/classes'] = ss({list:S.classesUp, source:S.classSource}); }
+  const po = S1['team/payouts'];
+  if(po){ if(ss({list:S.cfg.payoutIndex||[]}) !== ss({list:po.list||[]})){ S.cfg.payoutIndex = po.list||[]; changed = true; } CL.last['team/payouts'] = ss({list:S.cfg.payoutIndex||[]}); }
   const bills = S1['team/bills'];
   if(bills){
     if(bills.at === today()){ const cur = ss({list:S.cfg.openBills, at:S.cfg.billsAt, none:!!S.cfg.noOpenBills}); if(cur !== ss(bills)){ S.cfg.openBills = bills.list||[]; S.cfg.billsAt = bills.at; S.cfg.noOpenBills = !!bills.none; changed = true; } CL.last['team/bills'] = ss({list:S.cfg.openBills, at:S.cfg.billsAt, none:!!S.cfg.noOpenBills}); }
@@ -1108,7 +1153,7 @@ async function flush(){
 }
 
 const glList = () => S.coaSource==='upload' ? S.coa.map(e => e.full) : S.derived.gls;
-const classList = () => { const s = S.classSource==='upload' ? S.classesUp.slice() : S.derived.classes.slice(); Object.values(S.cfg.classMap).forEach(c => { if(c && !s.includes(c)) s.push(c); }); return s.sort((a,b) => a.localeCompare(b)); };
+const classList = () => { const s = S.classSource==='upload' ? S.classesUp.slice() : S.derived.classes.slice(); Object.values(S.cfg.classMap).forEach(c => { if(c && !s.includes(c)) s.push(c); }); return s.filter(c => !Engine.isRetiredClass(c)).sort((a,b) => a.localeCompare(b)); };
 
 /* ---------- engine wiring ---------- */
 const acctFor = f => { const a = ACCOUNTS[f.acctIdx]; return Object.assign({}, a, {bankClass: S.cfg.classOverrides[a.num] ?? a.bankClass}); };
@@ -1253,8 +1298,14 @@ function clsSelect(id, value, allowOwner){
   return `<select data-d="${id}" data-k="cls"><option value="">Choose a class</option>${list.map(c=>{ const res = Engine.isReserved(c), own = Engine.isOwnerClass(c) && !allowOwner; return `<option value="${esc(c)}" ${c===value?'selected':''} ${res||own?'disabled':''}>${esc(c)}${res?' (reserved, Steven personal book)':own?' (not for Empire transactions)':''}</option>`; }).join('')}${value && !list.includes(value)?`<option value="${esc(value)}" selected>${esc(value)}</option>`:''}</select>`;
 }
 const payoutLocs = () => S.cfg.payoutLocations || Engine.DEFAULT_PAYOUT_LOCATIONS;
+function payoutBlock(r, d){
+  const o = r.payoutOptions || [], n = (S.cfg.payoutIndex||[]).length;
+  if(!o.length) return `<div class="picks"><span class="lbl">${r.platform==='Xola' ? (n ? 'No Xola payout of this amount was found.' : 'No Xola payouts are loaded (Data &amp; rules, Xola payouts).') : 'Class cannot be read from the bank line.'} Administrative is the default. Change the class below if you know it.</span></div>`;
+  const chips = o.map((x,i) => { const sel = x.personal ? d.personal : (!d.personal && d.cls && d.cls===x.cls); return `<button type="button" class="pick" aria-pressed="${sel?'true':'false'}" ${sel?'style="outline:2px solid var(--accent,#2563eb)"':''} data-pick-opt="${r.id}" data-i="${i}">${x.personal?'Steven personal book':esc(x.cls||'Class not in the SOP table')} <span class="sub">${esc(x.locs.map(l=>l.replace(/_/g,' ')).join(', '))}${x.dates.length?' · paid '+esc(x.dates.join(', ')):''}</span></button>`; }).join('');
+  return `<div class="picks"><span class="lbl">${o.length>1?'Same amount in several Xola locations. Choose the class:':'Matching Xola payout:'}</span>${chips}</div>`;
+}
 function draftFor(r){
-  if(!S.drafts[r.id]) S.drafts[r.id] = { vendor: r.qboVendor || r.vendor || r.platform || '', gl: r.gl || '', loc: '', cls: (r.cls && !/^run class/i.test(r.cls)) ? r.cls : (r.adminDefault ? (S.cfg.classMap.Administrative || Engine.DEFAULT_CLASS_MAP.Administrative) : r.proposedClass) };
+  if(!S.drafts[r.id]) S.drafts[r.id] = { vendor: r.qboVendor || r.vendor || r.platform || '', gl: r.gl || '', loc: (r.payoutOptions&&r.payoutOptions.length===1) ? r.payoutOptions[0].locs.join(', ') : '', personal: !!(r.payoutOptions&&r.payoutOptions.length===1&&r.payoutOptions[0].personal), cls: (r.cls && !/^run class/i.test(r.cls)) ? r.cls : (r.adminDefault ? (S.cfg.classMap.Administrative || Engine.DEFAULT_CLASS_MAP.Administrative) : r.pickClass ? '' : r.proposedClass) };
   return S.drafts[r.id];
 }
 function vResolve(){
@@ -1276,7 +1327,7 @@ function vResolve(){
       const sim = (r.suggest||[]).map((s,i) => `<button class="pick" data-pick-vendor="${r.id}" data-i="${i}">${esc(s.vendor)} <span class="sub">tier ${esc(s.tier)}</span></button>`).join('');
       const gls = suggestGl.map((g,i) => `<button class="pick" data-pick-gl="${r.id}" data-g="${esc(g)}">${esc(g)}</button>`).join('');
       body = `${sim?`<div class="picks"><span class="lbl">Existing vendors that may match:</span>${sim}</div>`:''}
-      ${r.payout?`<label class="f">Which location's report was this payout downloaded from?<select data-d="${r.id}" data-k="loc"><option value="">Choose the location</option>${payoutLocs().map(l=>`<option value="${esc(l.name)}" ${d.loc===l.name?'selected':''}>${esc(l.name.replace(/_/g,' '))}${l.personal?' (Steven personal book)':''}</option>`).join('')}</select>${(()=>{ const cl=payoutLocs().find(l=>l.name===d.loc); if(cl&&!cl.personal&&d.cls&&cl.cls!==d.cls) return `<span class="hint" style="color:#b45309">The SOP table puts ${esc(cl.name.replace(/_/g,' '))} in ${esc(cl.cls||'(no class)')}. You chose ${esc(d.cls)}. Keep it only if you are sure.</span>`; if(d.loc||!d.cls) return ''; const m=payoutLocs().filter(l=>!l.personal&&l.cls===d.cls); return m.length?`<span class="picks"><span class="lbl">Locations that use ${esc(d.cls)}:</span>${m.map(l=>`<button type="button" class="pick" data-pick-loc="${r.id}" data-l="${esc(l.name)}">${esc(l.name.replace(/_/g,' '))}</button>`).join('')}</span>`:`<span class="hint" style="color:var(--warn,#b45309)">No Xola / Viator location posts to ${esc(d.cls)}. Choose the location the report came from.</span>`; })()}<span class="hint">${d.loc&&payoutLocs().find(l=>l.name===d.loc&&l.personal)?'This location is one of Steven\'s personal properties. Confirming sends it to his personal book, not to the Empire import.':'The class is filled in from the confirmed table in SOP 13.6. Change it if the report says otherwise.'}</span></label>`:''}
+      ${r.payout?payoutBlock(r,d):''}
       <div class="two"><label class="f">Vendor (exact QBO name)<input type="text" list="vlist" data-d="${r.id}" data-k="vendor" value="${esc(d.vendor)}"><span class="hint">${r.account.cur==='GBP'?'Wise GBP vendors end in _G.':r.account.cur==='EUR'?'Euro vendors end in _E.':'Use the name exactly as in QBO.'}</span></label>
       <label class="f">Class${clsSelect(r.id, d.cls, r.steven)}<span class="hint">${r.proposedWhy?'Proposed from '+esc(r.proposedWhy):''}</span></label></div>
       <label class="f">GL account<div class="glrow"><input type="search" placeholder="Filter accounts" data-filter-gl="${r.id}">${glSelect(r.id, d.gl, suggestGl)}</div></label>
@@ -1445,11 +1496,12 @@ const TABLES = {
   emailRules:{label:'Jonathan email rules', cols:[['vendor','Vendor'],['gl','GL account'],['cls','Class'],['date','Email date','date'],['note','Note']], blank:{vendor:'',gl:'',cls:'',date:'',note:''}, help:'Every instruction Jonathan gives by email, dated. Check new emails that are not logged yet before you upload. The most recent email wins over the Vendor Master and bank rules.'},
   bankRules:{label:'Bank rules', cols:[['contains','Description contains'],['vendor','Vendor'],['gl','GL account'],['cls','Class']], blank:{contains:'',vendor:'',gl:'',cls:''}, help:'A rule fires only when the description text and the vendor both match. A description-only match is held as a possible misfire.'},
   openBills:{label:'Open bills', cols:[['vendor','Vendor'],['amount','Amount','number'],['date','Bill date','date'],['bucket','Aging bucket'],['no','Bill no.']], blank:{vendor:'',amount:0,date:'',bucket:'',no:''}, help:'Open bills in QuickBooks. A payment for the same vendor and amount goes to the Bill Payments List instead of being categorised. The A/P Aging Summary has no bill dates, so its Bill date stays empty and the due window is worked out from the "As of" date and the age bucket. For exact bill dates and bill numbers upload the A/P Aging Detail report.'},
+  payoutIndex:{label:'Xola payouts', cols:[['loc','Location'],['date','Payout date','date'],['net','Net amount (bank deposit)','number'],['src','Source']], blank:{loc:'',date:'',net:0,src:'manual'}, help:'Each Xola payout by location. The sum of the Net column of a Xola Payouts Report equals the amount deposited in the bank, so a bank deposit is matched to a location by its amount, and the location gives the class (SOP 13.6). Filled from the Xola API or from the Payouts Reports you upload. If two locations paid exactly the same amount, the Team Member is asked which class to use.'},
   payrollMap:{label:'Payroll (non-US)', cols:[['name','Employee (exact QBO vendor name)'],['cls','Class']], blank:{name:'',cls:''}, help:'From Louise Petrie\'s payroll Excel (SOP 4.1 Step 3). A payroll entry for a listed employee takes this class instead of being held. Upload the Excel, or add rows by hand.'},
   newVendorLog:{label:'New Vendor Log', cols:[['vendor','Vendor'],['gl','Proposed GL'],['cls','Proposed class'],['date','Coded on','date'],['by','Coded by'],['status','Status']], blank:{vendor:'',gl:'',cls:'',date:'',by:'',status:'proposed'}, help:'Filled automatically when a new vendor is confirmed. Stays "proposed" until it appears in the weekly send to Jonathan and is not challenged.'}
 };
-const EMPTY = {payrollMap:'<b>No payroll classes loaded.</b>Upload Louise Petrie\'s payroll Excel. Until then, payroll entries on a non-US class are held for a person to confirm.', emailRules:'<b>None added yet.</b>Add only emails received after the Vendor Master was built. A newer dated row here overrides the Vendor Master.', bankRules:'<b>None added yet.</b>Add only extra bank rules that are not in the Vendor Master.', openBills:'<b>No open bills loaded.</b>Upload the QBO A/P Aging report above each day. Until then, vendors with recent bills are held as New.', newVendorLog:'<b>Empty until you confirm a new vendor.</b>Each new vendor you confirm on the Resolve step is added here automatically.'};
-const DATA_TABS = [['master','Vendor Master'],['emailRules','Jonathan email rules'],['bankRules','Bank rules'],['openBills','Open bills'],['newVendorLog','New Vendor Log'],['payrollMap','Payroll (non-US)'],['classMap','Class map'],['other','Other rules']];
+const EMPTY = {payoutIndex:'<b>No Xola payouts loaded.</b>Use "Fetch from Xola" or upload the Payouts Report of each location. Without them, Xola deposits get the Administrative class.', payrollMap:'<b>No payroll classes loaded.</b>Upload Louise Petrie\'s payroll Excel. Until then, payroll entries on a non-US class are held for a person to confirm.', emailRules:'<b>None added yet.</b>Add only emails received after the Vendor Master was built. A newer dated row here overrides the Vendor Master.', bankRules:'<b>None added yet.</b>Add only extra bank rules that are not in the Vendor Master.', openBills:'<b>No open bills loaded.</b>Upload the QBO A/P Aging report above each day. Until then, vendors with recent bills are held as New.', newVendorLog:'<b>Empty until you confirm a new vendor.</b>Each new vendor you confirm on the Resolve step is added here automatically.'};
+const DATA_TABS = [['master','Vendor Master'],['emailRules','Jonathan email rules'],['bankRules','Bank rules'],['openBills','Open bills'],['payoutIndex','Xola payouts'],['newVendorLog','New Vendor Log'],['payrollMap','Payroll (non-US)'],['classMap','Class map'],['other','Other rules']];
 
 function tierBreakdown(){ const c = {}; S.master.forEach(m => c[m.tier] = (c[m.tier]||0)+1); return Object.keys(TIERS).filter(t => c[t]).map(t => `<span class="tag" title="${esc(TIERS[t])}">${t} ${c[t]}</span>`).join(' '); }
 function vData(){
@@ -1459,6 +1511,7 @@ function vData(){
     <div class="card dcard"><h3>Vendor Master</h3><p>${m?`${m} vendors${S.mMeta?' from '+esc(S.mMeta.file)+', loaded '+esc(S.mMeta.at):''}.`:'Not loaded. Upload the Empire Vendor Master workbook once. It is saved for the team when team storage is on, otherwise in this browser.'}</p>${m?`<div>${tierBreakdown()}</div>`:''}<div class="row">${up('upMaster', m?'Replace Vendor Master':'Upload Vendor Master', '.xlsx,.xls,.csv')}${m?'<button class="btn small" data-export="master">Save updated Excel</button>':''}</div></div>
     <div class="card dcard"><h3>Chart of accounts</h3><p>${S.coaSource==='upload'?`${S.coa.length} accounts from your upload. These fill every GL dropdown and are used to check accounts.`:`Using ${S.derived.gls.length} account names taken from the Vendor Master. Upload the full chart (QBO Account List, CSV or Excel) to get every account with its number.`}</p><div class="row">${up('upCoa', 'Upload chart of accounts', '.xlsx,.xls,.csv')}${S.coaSource==='upload'?'<button class="btn small ghost" data-clear="coa">Clear</button>':''}</div></div>
     <div class="card dcard"><h3>Classes</h3><p>${S.classSource==='upload'?`${S.classesUp.length} classes from your upload.`:`Using ${S.derived.classes.length} classes taken from the Vendor Master. Upload the full class list to get every class.`}</p><div class="row">${up('upClasses', 'Upload classes', '.xlsx,.xls,.csv')}${S.classSource==='upload'?'<button class="btn small ghost" data-clear="classes">Clear</button>':''}</div></div>
+    <div class="card dcard" id="xolaCard"><h3>Xola payouts</h3><p>${(S.cfg.payoutIndex||[]).length?`${S.cfg.payoutIndex.length} payouts from ${new Set(S.cfg.payoutIndex.map(x=>x.loc)).size} locations.`:'Not loaded. A Xola deposit is matched to its location by amount, which gives the class.'}</p><div class="row"><button class="btn small" id="xolaFetch">Fetch from Xola</button><span class="filebtn btn small">Upload Payouts Reports<input type="file" id="upXola" accept=".xlsx,.xls,.csv" multiple></span></div></div>
     <div class="card dcard" id="billsCard"><h3>Open bills</h3><p>${S.cfg.openBills.length?`Open balances for ${new Set(S.cfg.openBills.map(b=>b.vendor)).size} vendors, loaded ${esc(S.cfg.billsAt||'')}. Kept for today only.`:S.cfg.noOpenBills?'You confirmed there are no open bills.':'Upload the QuickBooks A/P Aging report (Summary or Detail, CSV or Excel) each day. Vendors with an open balance are read automatically.'}</p><div class="row">${up('upBills', 'Upload open bills', '.xlsx,.xls,.csv')}<button class="btn small" data-nobills="1">${S.cfg.noOpenBills?'Undo: there are open bills':'There are no open bills today'}</button></div></div>
   </div>`;
   let body;
@@ -1487,7 +1540,9 @@ function vData(){
     const withRules = tab==='emailRules' || tab==='bankRules';
     const buttons = `<div class="row"><button class="btn" data-add="1">Add row</button>${tab==='emailRules'||tab==='bankRules'||tab==='payrollMap'?up('imp-'+tab,'Import CSV / Excel','.xlsx,.xls,.csv'):''}</div>`;
     const billSum = tab==='openBills' && list.length ? `<div class="banner"><span><b>${new Set(list.map(b=>b.vendor)).size} vendors</b> have open balances, ${list.filter(b=>!b.total).length} balance line${list.filter(b=>!b.total).length===1?'':'s'}, loaded ${esc(S.cfg.billsAt||'')}. ${list.some(b=>b.date)?'':'This is the Aging Summary, so there are no bill dates. Upload the A/P Aging Detail to get dates and bill numbers.'}</span></div>` : '';
-    body = `<p class="sub" style="margin:0">${T.help}</p>${billSum}${buttons}${withRules?`<h3 style="font-size:15px;margin:6px 0 0">Added by the team (${list.length})</h3>`:''}<div class="tablewrap"><table><thead><tr>${head}</tr></thead><tbody>${rws||`<tr><td colspan="${cols.length+1}" class="empty">${EMPTY[tab]||'Empty.'}</td></tr>`}</tbody></table></div>${withRules?masterRuleSection(tab):''}`;
+    const unk = tab==='payoutIndex' ? [...new Set(list.map(x=>x.loc).filter(l=>l && !Engine.findLoc(l, S.cfg)))] : [];
+    const payoutSum = tab==='payoutIndex' && unk.length ? `<div class="banner warn"><span><b>Location not in the SOP table:</b> ${unk.map(esc).join(', ')}. Rename it to a name from SOP 13.6 (for example Chicago_Discount_Tours), or it cannot give a class.</span></div>` : '';
+    body = `<p class="sub" style="margin:0">${T.help}</p>${billSum}${payoutSum}${buttons}${withRules?`<h3 style="font-size:15px;margin:6px 0 0">Added by the team (${list.length})</h3>`:''}<div class="tablewrap"><table><thead><tr>${head}</tr></thead><tbody>${rws||`<tr><td colspan="${cols.length+1}" class="empty">${EMPTY[tab]||'Empty.'}</td></tr>`}</tbody></table></div>${withRules?masterRuleSection(tab):''}`;
   }
   return `
   <div class="pagehead"><div><h2>Data &amp; rules</h2><p>The inputs the SOP names: Vendor Master, chart of accounts, classes, open bills, Jonathan's email rules and the bank rules. Upload each once. They are saved for the whole team when team storage is on (see the badge at the top), otherwise in this browser only.</p></div></div>
@@ -1625,6 +1680,49 @@ async function importBills(f){
   if(!out.length) throw new Error('No open bills found.');
   S.cfg.openBills = out; S.cfg.noOpenBills = false; S.cfg.billsAt = today(); saveAll(); rerun(); toast(`Open bills loaded: ${new Set(out.map(o=>o.vendor)).size} vendors`);
 }
+/* ---------- Xola payouts ---------- */
+const prune = list => { const cut = new Date(Date.now() - 150*864e5).toISOString().slice(0,10); return list.filter(x => !x.date || x.date >= cut); };
+function mergePayouts(entries, src){
+  const m = new Map((S.cfg.payoutIndex||[]).map(x => [Engine.normLoc(x.loc)+'|'+x.date, x]));
+  entries.forEach(e => m.set(Engine.normLoc(e.loc)+'|'+e.date, {loc:e.loc, date:e.date, net:Math.round(e.net*100)/100, src}));
+  S.cfg.payoutIndex = prune([...m.values()]).sort((a,b) => (b.date||'').localeCompare(a.date||'') || a.loc.localeCompare(b.loc));
+  saveAll(); rerun();
+}
+async function importXola(files){
+  let n = 0; const bad = [];
+  for(const f of files){
+    try{
+      const {sheets, names} = await readSheets(f); const aoa = sheets[names[0]];
+      const h = aoa.findIndex((r,i) => i < 40 && r.some(c => /^net$/i.test(String(c).trim())) && r.some(c => /payout date/i.test(String(c))));
+      if(h < 0){ bad.push(f.name + ': no Net and Payout Date columns'); continue; }
+      const H = aoa[h].map(x => String(x).trim().toLowerCase()); const iN = H.indexOf('net'), iD = H.findIndex(x => /payout date/.test(x));
+      const loc = f.name.replace(/\.[a-z0-9]+$/i,'').replace(/payouts?|report/ig,' ').replace(/\d{4}[-_]\d{2}[-_]\d{2}|\d{1,2}[-_]\d{1,2}[-_]\d{2,4}/g,' ').replace(/[_\s-]+/g,' ').trim();
+      const g = new Map();
+      aoa.slice(h+1).forEach(r => { const d = normDate(r[iD]); const a = Engine.money(r[iN]); if(!d || !a) return; g.set(d, (g.get(d)||0) + a); });
+      if(!g.size){ bad.push(f.name + ': no payout rows'); continue; }
+      const found = Engine.findLoc(loc, S.cfg);
+      mergePayouts([...g].map(([date, net]) => ({loc: found ? found.name : loc.replace(/\s+/g,'_'), date, net})), 'report');
+      n += g.size;
+    }catch(e){ bad.push(f.name + ': ' + (e.message||'could not be read')); }
+  }
+  S.dataTab = 'payoutIndex';
+  toast(n ? `Xola payouts loaded: ${n} payout${n===1?'':'s'}.${bad.length?' Skipped: '+bad.join('; '):''}` : (bad.join('; ') || 'No payouts found.'));
+}
+async function xolaFetch(){
+  let key = ''; try{ key = localStorage.getItem('empire-key') || ''; }catch(e){}
+  if(!/^https?:$/.test(location.protocol)) return toast('Fetching from Xola works on the web address (Vercel), not in a saved file.');
+  toast('Asking Xola for payouts…');
+  try{
+    const from = new Date(Date.now() - 60*864e5).toISOString().slice(0,10);
+    const r = await fetch('/api/xola', {method:'POST', headers:{'content-type':'application/json','x-app-key':key}, body:JSON.stringify({from})});
+    const j = await r.json().catch(() => ({}));
+    if(!r.ok) return toast(j.error || ('Xola request failed (' + r.status + ').'));
+    if(!(j.entries||[]).length) return toast((j.note || 'Xola returned no payouts.') + (j.errors&&j.errors.length?' '+j.errors.join('; '):''));
+    const norm = j.entries.map(e => { const f = Engine.findLoc(e.loc, S.cfg); return {loc: f ? f.name : e.loc, date:e.date, net:e.net}; });
+    mergePayouts(norm, 'Xola API'); S.dataTab = 'payoutIndex'; render();
+    toast(`Xola: ${norm.length} payouts from ${new Set(norm.map(x=>x.loc)).size} locations.${j.errors&&j.errors.length?' Problems: '+j.errors.join('; '):''}`);
+  }catch(e){ toast('Could not reach Xola: ' + (e.message||e)); }
+}
 async function importPayroll(f){
   const {sheets, names} = await readSheets(f);
   const classes = classList(), byLast = {};
@@ -1737,13 +1835,10 @@ function weeklyNote(){
 function confirmRow(id){
   const r = S.results.find(x => x.id===id), dr = S.drafts[id];
   if(!S.member.trim()) return toast('Enter the team member name first.');
-  if(r.payout){
-    const l = payoutLocs().find(x => x.name===dr.loc);
-    if(!l) return toast('Choose the location this payout came from first.');
-    if(l.personal){ r.resolved = {confirmed:true, personal:true, loc:dr.loc, vendor:dr.vendor||r.platform, gl:'Steven personal book', cls:'', by:S.member.trim(), isNewVendor:false}; S.signed = null; render(); return toast('Confirmed. This payout belongs to Steven\'s personal book and is on the Steven personal list, not the Empire import.'); }
-  }
+  if(r.payout && dr.personal){ r.resolved = {confirmed:true, personal:true, loc:dr.loc, vendor:dr.vendor||r.platform, gl:'Steven personal book', cls:'', by:S.member.trim(), isNewVendor:false}; S.signed = null; render(); return toast('Confirmed. This payout belongs to Steven\'s personal book and is on the Steven personal list, not the Empire import.'); }
   if(!dr.vendor.trim() || !dr.gl.trim() || !dr.cls.trim()) return toast('Vendor, GL account and class are all required.');
   if(Engine.isOwnerClass(dr.cls) && !r.steven) return toast('"Owner Distribution" is not used for Empire transactions. Steven personal charges are handled by the Vendor Master rule.');
+  if(Engine.isRetiredClass(dr.cls)) return toast('That class is not used. Use Empire Tours:Chicago instead.');
   if(Engine.isReserved(dr.cls)) return toast(`"${dr.cls}" is reserved for Steven Garcia's personal book. Choose an Empire class.`);
   const vend = dr.vendor.trim();
   if(!r.payout && !r.steven && !S.mHeader.length && !S.master.some(m => Engine.norm(m.vendor)===Engine.norm(vend))) return toast('Load the Vendor Master first, so a new vendor can be added to it.');
@@ -1769,7 +1864,7 @@ function confirmRow(id){
 }
 
 document.addEventListener('click', e => {
-  const t = e.target.closest('[data-view],[data-filter],[data-open],[data-confirm],[data-undo],[data-add],[data-del],[data-dtab],[data-export],[data-save-list],[data-force],[data-goto-data],[data-pick-vendor],[data-pick-loc],[data-pick-gl],[data-clear],[data-nobills],[data-feed-del],button');
+  const t = e.target.closest('[data-view],[data-filter],[data-open],[data-confirm],[data-undo],[data-add],[data-del],[data-dtab],[data-export],[data-save-list],[data-force],[data-goto-data],[data-pick-vendor],[data-pick-opt],[data-pick-gl],[data-clear],[data-nobills],[data-feed-del],button');
   if(!t) return;
   const d = t.dataset;
   if(d.view) return go(d.view);
@@ -1786,20 +1881,20 @@ document.addEventListener('click', e => {
   if(d.clear){ if(d.clear==='coa'){ S.coa = []; S.coaSource = ''; rerun(); } else { S.classesUp = []; S.classSource = ''; } saveAll(); return render(); }
   if(d.nobills){ S.cfg.noOpenBills = !S.cfg.noOpenBills; if(S.cfg.noOpenBills){ S.cfg.openBills = []; } saveAll(); rerun(); return render(); }
   if(d.undo){ const r = S.results.find(x => x.id===d.undo); r.resolved = null; S.signed = null; return render(); }
-  if(d.pickLoc){ const l = payoutLocs().find(x=>x.name===d.l); const dr = S.drafts[d.pickLoc]; dr.loc = d.l; if(l && !l.personal && l.cls) dr.cls = l.cls; return render(); }
+  if(d.pickOpt){ const r = S.results.find(x=>x.id===d.pickOpt), x = r.payoutOptions[+d.i], dr = S.drafts[r.id]; dr.personal = !!x.personal; dr.cls = x.personal ? '' : x.cls; dr.loc = x.locs.join(', '); return render(); }
   if(d.confirm) return confirmRow(d.confirm);
   if(d.pickVendor){
     const r = S.results.find(x => x.id===d.pickVendor), s = r.suggest[+d.i], dr = S.drafts[r.id], card = t.closest('.rc');
     dr.vendor = s.vendor; card.querySelector('[data-k=vendor]').value = s.vendor;
     if(s.gl && s.gl!=='UNCLEAR' && !/\(per invoice\)|\(liability\)/i.test(s.gl)){ dr.gl = s.gl; const sel = card.querySelector('[data-k=gl]'); if(![...sel.options].some(o => o.value===s.gl)){ const o = document.createElement('option'); o.value = s.gl; o.textContent = s.gl; sel.appendChild(o); } sel.value = s.gl; }
-    if(s.cls && !/^run class|^n\/a|^bifurcate/i.test(s.cls)){ dr.cls = s.cls; const sel = card.querySelector('[data-k=cls]'); if(![...sel.options].some(o => o.value===s.cls)){ const o = document.createElement('option'); o.value = s.cls; o.textContent = s.cls; sel.appendChild(o); } sel.value = s.cls; }
+    if(s.cls && !/^run class|^n\/a|^bifurcate/i.test(s.cls)){ dr.cls = Engine.remapClass(s.cls); const sel = card.querySelector('[data-k=cls]'); if(![...sel.options].some(o => o.value===s.cls)){ const o = document.createElement('option'); o.value = s.cls; o.textContent = s.cls; sel.appendChild(o); } sel.value = s.cls; }
     return toast('Filled from the existing vendor. Check it before you confirm.');
   }
   if(d.pickGl){ const dr = S.drafts[d.pickGl], card = t.closest('.rc'), sel = card.querySelector('[data-k=gl]'); dr.gl = d.g; if(![...sel.options].some(o => o.value===d.g)){ const o = document.createElement('option'); o.value = d.g; o.textContent = d.g; sel.appendChild(o); } sel.value = d.g; return; }
   if(t.id==='dataBtn') return go('data');
   if(t.id==='processBtn'){ process(); if(!S.txs.length) return toast('No transactions found. Check the column headers (Date, DESCRIPTION, Payee, SPENT, RECEIVED).'); S.filter = 'all'; go('results'); return toast(`Loaded ${S.txs.length} transactions from ${S.feeds.length} file${S.feeds.length===1?'':'s'}`); }
   if(t.id==='signBtn'){ S.signed = {by:S.reviewer.trim(), at:new Date().toLocaleString()}; return render(); }
-  if(t.id==='xWeekly') return copyText(weeklyNote(), 'Weekly note copied');
+  if(t.id==='xolaFetch') return xolaFetch();
 });
 document.addEventListener('input', e => {
   const t = e.target;
@@ -1817,7 +1912,7 @@ document.addEventListener('input', e => {
 });
 document.addEventListener('change', async e => {
   const t = e.target, d = t.dataset;
-  if(d.d && t.tagName==='SELECT'){ S.drafts[d.d][d.k] = t.value; if(d.k==='cls'){ const rr = S.results.find(x=>x.id===d.d); if(rr&&rr.payout){ const m = payoutLocs().filter(l=>!l.personal&&l.cls===t.value); { const cur = payoutLocs().find(l=>l.name===S.drafts[d.d].loc); if(m.length===1 && !(cur && cur.cls===t.value)) S.drafts[d.d].loc = m[0].name; } render(); return; } } if(d.k==='loc'){ const l = payoutLocs().find(x => x.name===t.value); S.drafts[d.d].cls = l && !l.personal ? l.cls : ''; render(); } return; }
+  if(d.d && t.tagName==='SELECT'){ S.drafts[d.d][d.k] = t.value; if(d.k==='cls') S.drafts[d.d].personal = false; return; }
   if(d.ack!==undefined){ S.acks[d.ack] = t.checked; S.signed = null; return render(); }
   if(d.feedAcct){ const f = S.feeds.find(x => String(x.id)===d.feedAcct); f.acctIdx = +t.value; if(f.acctIdx >= 0) f.count = Engine.loadFeed(f.text, acctFor(f), 'x').length; return render(); }
   if(d.acls!==undefined){ S.cfg.classOverrides[d.acls] = t.value; saveAll(); if(S.feeds.length) rerun(); toast('Saved'); return; }
@@ -1835,6 +1930,7 @@ document.addEventListener('change', async e => {
   if(t.id==='upCoa') return doImport(importCoa, t);
   if(t.id==='upClasses') return doImport(importClasses, t);
   if(t.id==='upBills') return doImport(importBills, t);
+  if(t.id==='upXola'){ try{ await importXola([...t.files]); }catch(e){ toast(e.message||'Could not read.'); } t.value=''; return render(); }
   if(t.id==='imp-payrollMap') return doImport(importPayroll, t);
   if(t.id && t.id.startsWith('imp-')) return doImport(f => importTable(t.id.slice(4), f), t);
 });

@@ -1511,7 +1511,7 @@ function vData(){
     <div class="card dcard"><h3>Vendor Master</h3><p>${m?`${m} vendors${S.mMeta?' from '+esc(S.mMeta.file)+', loaded '+esc(S.mMeta.at):''}.`:'Not loaded. Upload the Empire Vendor Master workbook once. It is saved for the team when team storage is on, otherwise in this browser.'}</p>${m?`<div>${tierBreakdown()}</div>`:''}<div class="row">${up('upMaster', m?'Replace Vendor Master':'Upload Vendor Master', '.xlsx,.xls,.csv')}${m?'<button class="btn small" data-export="master">Save updated Excel</button>':''}</div></div>
     <div class="card dcard"><h3>Chart of accounts</h3><p>${S.coaSource==='upload'?`${S.coa.length} accounts from your upload. These fill every GL dropdown and are used to check accounts.`:`Using ${S.derived.gls.length} account names taken from the Vendor Master. Upload the full chart (QBO Account List, CSV or Excel) to get every account with its number.`}</p><div class="row">${up('upCoa', 'Upload chart of accounts', '.xlsx,.xls,.csv')}${S.coaSource==='upload'?'<button class="btn small ghost" data-clear="coa">Clear</button>':''}</div></div>
     <div class="card dcard"><h3>Classes</h3><p>${S.classSource==='upload'?`${S.classesUp.length} classes from your upload.`:`Using ${S.derived.classes.length} classes taken from the Vendor Master. Upload the full class list to get every class.`}</p><div class="row">${up('upClasses', 'Upload classes', '.xlsx,.xls,.csv')}${S.classSource==='upload'?'<button class="btn small ghost" data-clear="classes">Clear</button>':''}</div></div>
-    <div class="card dcard" id="xolaCard"><h3>Xola payouts</h3><p>${(S.cfg.payoutIndex||[]).length?`${S.cfg.payoutIndex.length} payouts from ${new Set(S.cfg.payoutIndex.map(x=>x.loc)).size} locations.`:'Not loaded. A Xola deposit is matched to its location by amount, which gives the class.'}</p><div class="row"><button class="btn small" id="xolaFetch">Fetch from Xola</button><span class="filebtn btn small">Upload Payouts Reports<input type="file" id="upXola" accept=".xlsx,.xls,.csv" multiple></span></div></div>
+    <div class="card dcard" id="xolaCard"><h3>Xola payouts</h3><p>${(S.cfg.payoutIndex||[]).length?`${S.cfg.payoutIndex.length} payouts from ${new Set(S.cfg.payoutIndex.map(x=>x.loc)).size} locations.`:'Not loaded. A Xola deposit is matched to its location by amount, which gives the class.'}</p><div class="row"><button class="btn small" id="xolaFetch">Fetch from Xola</button><button class="btn small" id="xolaList">Show Xola locations (for XOLA_SELLERS)</button><span class="filebtn btn small">Upload Payouts Reports<input type="file" id="upXola" accept=".xlsx,.xls,.csv" multiple></span></div></div>
     <div class="card dcard" id="billsCard"><h3>Open bills</h3><p>${S.cfg.openBills.length?`Open balances for ${new Set(S.cfg.openBills.map(b=>b.vendor)).size} vendors, loaded ${esc(S.cfg.billsAt||'')}. Kept for today only.`:S.cfg.noOpenBills?'You confirmed there are no open bills.':'Upload the QuickBooks A/P Aging report (Summary or Detail, CSV or Excel) each day. Vendors with an open balance are read automatically.'}</p><div class="row">${up('upBills', 'Upload open bills', '.xlsx,.xls,.csv')}<button class="btn small" data-nobills="1">${S.cfg.noOpenBills?'Undo: there are open bills':'There are no open bills today'}</button></div></div>
   </div>`;
   let body;
@@ -1683,8 +1683,9 @@ async function importBills(f){
 /* ---------- Xola payouts ---------- */
 const prune = list => { const cut = new Date(Date.now() - 150*864e5).toISOString().slice(0,10); return list.filter(x => !x.date || x.date >= cut); };
 function mergePayouts(entries, src){
-  const m = new Map((S.cfg.payoutIndex||[]).map(x => [Engine.normLoc(x.loc)+'|'+x.date, x]));
-  entries.forEach(e => m.set(Engine.normLoc(e.loc)+'|'+e.date, {loc:e.loc, date:e.date, net:Math.round(e.net*100)/100, src}));
+  const k = x => Engine.normLoc(x.loc)+'|'+x.date+'|'+(Math.round(x.net*100)/100);
+  const m = new Map((S.cfg.payoutIndex||[]).map(x => [k(x), x]));
+  entries.forEach(e => m.set(k(e), {loc:e.loc, date:e.date, net:Math.round(e.net*100)/100, src}));
   S.cfg.payoutIndex = prune([...m.values()]).sort((a,b) => (b.date||'').localeCompare(a.date||'') || a.loc.localeCompare(b.loc));
   saveAll(); rerun();
 }
@@ -1692,11 +1693,13 @@ async function importXola(files){
   let n = 0; const bad = [];
   for(const f of files){
     try{
-      const {sheets, names} = await readSheets(f); const aoa = sheets[names[0]];
-      const h = aoa.findIndex((r,i) => i < 40 && r.some(c => /^net$/i.test(String(c).trim())) && r.some(c => /payout date/i.test(String(c))));
-      if(h < 0){ bad.push(f.name + ': no Net and Payout Date columns'); continue; }
+      const {sheets, names} = await readSheets(f);
+      let aoa = null, h = -1;
+      for(const n of names){ const a = sheets[n]; const i = a.findIndex((r,k) => k < 40 && r.some(c => /^net$/i.test(String(c).trim())) && r.some(c => /payout date/i.test(String(c)))); if(i >= 0){ aoa = a; h = i; break; } }   // the Excel export has several tabs (Report Details, Summary, Transactions)
+      if(!aoa){ bad.push(f.name + ': no Net and Payout Date columns'); continue; }
       const H = aoa[h].map(x => String(x).trim().toLowerCase()); const iN = H.indexOf('net'), iD = H.findIndex(x => /payout date/.test(x));
-      const loc = f.name.replace(/\.[a-z0-9]+$/i,'').replace(/payouts?|report/ig,' ').replace(/\d{4}[-_]\d{2}[-_]\d{2}|\d{1,2}[-_]\d{1,2}[-_]\d{2,4}/g,' ').replace(/[_\s-]+/g,' ').trim();
+      let company = ''; for(const n of names){ const row = (sheets[n]||[]).slice(0,30).find(r => /^company$/i.test(String(r[0]).trim()) && String(r[1]||'').trim()); if(row){ company = String(row[1]).trim(); break; } }
+      const loc = company || f.name.replace(/\.[a-z0-9]+$/i,'').replace(/payouts?|report/ig,' ').replace(/\d{4}[-_]\d{2}[-_]\d{2}|\d{1,2}[-_]\d{1,2}[-_]\d{2,4}/g,' ').replace(/[_\s-]+/g,' ').trim();
       const g = new Map();
       aoa.slice(h+1).forEach(r => { const d = normDate(r[iD]); const a = Engine.money(r[iN]); if(!d || !a) return; g.set(d, (g.get(d)||0) + a); });
       if(!g.size){ bad.push(f.name + ': no payout rows'); continue; }
@@ -1707,6 +1710,24 @@ async function importXola(files){
   }
   S.dataTab = 'payoutIndex';
   toast(n ? `Xola payouts loaded: ${n} payout${n===1?'':'s'}.${bad.length?' Skipped: '+bad.join('; '):''}` : (bad.join('; ') || 'No payouts found.'));
+}
+async function xolaList(){
+  let key = ''; try{ key = localStorage.getItem('empire-key') || ''; }catch(e){}
+  if(!/^https?:$/.test(location.protocol)) return toast('This works on the web address (Vercel), not in a saved file.');
+  try{
+    const r = await fetch('/api/xola', {method:'POST', headers:{'content-type':'application/json','x-app-key':key}, body:JSON.stringify({list:true})});
+    const j = await r.json().catch(() => ({}));
+    if(!r.ok) return toast(j.error || ('Xola request failed (' + r.status + ').'));
+    const L = j.sellers || []; if(!L.length) return toast(j.note || 'Xola returned no locations for this key.');
+    const map = {}, unk = [];
+    L.forEach(s => { const f = Engine.findLoc(s.name, S.cfg); if(f) map[f.name] = s.id; else { map[String(s.name).replace(/\s+/g,'_')] = s.id; unk.push(s.name); } });
+    const txt = JSON.stringify(map, null, 1);
+    const o = document.createElement('div'); o.className = 'keyov';
+    o.innerHTML = `<div class="card keybox" style="max-width:640px"><h3>XOLA_SELLERS</h3><p class="sub">${L.length} Xola locations found. Copy this whole text into Vercel as the value of XOLA_SELLERS, then redeploy.${unk.length?' Not in the SOP table (check the spelling): '+esc(unk.join(', '))+'.':' All names match the SOP table.'}</p><textarea id="selTxt" rows="12" style="width:100%;font-family:monospace;font-size:12px" readonly>${esc(txt)}</textarea><div class="row" style="justify-content:flex-end"><button class="btn" id="selCopy">Copy</button><button class="btn primary" id="selClose">Close</button></div></div>`;
+    document.body.appendChild(o);
+    o.querySelector('#selCopy').onclick = () => copyText(txt, 'Copied');
+    o.querySelector('#selClose').onclick = () => o.remove();
+  }catch(e){ toast('Could not reach Xola: ' + (e.message||e)); }
 }
 async function xolaFetch(){
   let key = ''; try{ key = localStorage.getItem('empire-key') || ''; }catch(e){}
@@ -1895,6 +1916,7 @@ document.addEventListener('click', e => {
   if(t.id==='processBtn'){ process(); if(!S.txs.length) return toast('No transactions found. Check the column headers (Date, DESCRIPTION, Payee, SPENT, RECEIVED).'); S.filter = 'all'; go('results'); return toast(`Loaded ${S.txs.length} transactions from ${S.feeds.length} file${S.feeds.length===1?'':'s'}`); }
   if(t.id==='signBtn'){ S.signed = {by:S.reviewer.trim(), at:new Date().toLocaleString()}; return render(); }
   if(t.id==='xolaFetch') return xolaFetch();
+  if(t.id==='xolaList') return xolaList();
 });
 document.addEventListener('input', e => {
   const t = e.target;

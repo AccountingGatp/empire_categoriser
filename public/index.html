@@ -179,7 +179,6 @@ td input[type=checkbox]{width:18px;height:18px}
   <div class="brand"><b>Empire Categoriser</b><span>Bank feed to SaasAnt</span></div>
   <nav class="steps" id="steps" aria-label="Steps"></nav>
   <span class="pill off" id="cloudPill">This browser only</span>
-  <button class="btn rulesbtn" id="auditBtn">Check old file</button>
   <button class="btn rulesbtn" id="dataBtn">Data &amp; rules</button>
 </div></header>
 <main class="wrap" id="app"></main>
@@ -467,25 +466,26 @@ const Engine = (() => {
         out.gl = cc.error ? clr : cc.name; out.cls = ''; out.source = 'Platform payout rule (SOP 13.6)';
         const opts = isXola ? payoutOptions(tx, cfg) : [];
         out.payoutOptions = opts;
-        const base = `Payout from ${out.platform}. It posts to the Clearing account (${out.gl}), never to revenue.`;
+        const base = `${out.platform} payout, posts to ${out.gl}.`;
         if (opts.length === 1 && !opts[0].personal && opts[0].cls) {
-          out.cls = opts[0].cls;
-          out.reason = `${base} The amount matches the Xola payout of ${opts[0].locs.join(', ')}${opts[0].dates.length ? ' (paid ' + opts[0].dates.join(', ') + ')' : ''}, so the class is ${opts[0].cls} (SOP 13.6). Confirm to add it.`;
+          out.cls = opts[0].cls; out.autoConfirm = true;
+          out.reason = `Matched to the Xola payout of ${opts[0].locs.join(', ').replace(/_/g, ' ')}${opts[0].dates.length ? ' (paid ' + opts[0].dates.join(', ') + ')' : ''}. Class ${opts[0].cls}. Posts to ${out.gl}.`;
           trace.push('Platform payout: amount matched one Xola payout, class from the location table.');
         } else if (opts.length === 1 && !opts[0].personal && !opts[0].cls) {
           out.adminDefault = true;
-          out.reason = `${base} The amount matches the Xola payout of ${opts[0].locs.join(', ')}, but that location has no class in the SOP table. Administrative is pre-selected (SOP 4.1 Step 5); choose the right class and tell the Reviewer so the table can be completed.`;
+          out.reason = `${base} Matched ${opts[0].locs.join(', ').replace(/_/g, ' ')}, which has no class in the SOP table. Administrative selected.`;
           trace.push('Platform payout: matched a location with no class in the table. Administrative by default.');
         } else if (opts.length === 1 && opts[0].personal) {
-          out.reason = `${base} The amount matches a payout of ${opts[0].locs.join(', ')}, a personal property of Steven Garcia. It belongs in his personal book, not the Empire import (SOP 13.6).`;
+          out.autoConfirm = true;
+          out.reason = `Matched to a payout of ${opts[0].locs.join(', ').replace(/_/g, ' ')}, a personal property of Steven Garcia. It goes to his personal book, not the Empire import (SOP 13.6).`;
           trace.push('Platform payout: matched a personal location (Steven).');
         } else if (opts.length > 1) {
           out.pickClass = true;
-          out.reason = `${base} More than one Xola location had a payout of exactly this amount (${opts.map(o => o.locs.join(', ')).join(' / ')}). Choose which one this deposit is.`;
+          out.reason = `${base} Same amount in several locations (${opts.map(o => o.locs.join(', ').replace(/_/g, ' ')).join(' / ')}). Choose one.`;
           trace.push('Platform payout: same amount in several locations. A person chooses the class.');
         } else {
           out.adminDefault = true;
-          out.reason = `${base} ${isXola ? ((cfg.payoutIndex || []).length ? 'No Xola payout of this amount was found' : 'No Xola payouts are loaded') : 'The class cannot be read from the bank line'}, so Administrative is pre-selected (SOP 4.1 Step 5) and the row goes on the Administrative Class Review List. Change it if you know the location.`;
+          out.reason = `${base} ${isXola ? ((cfg.payoutIndex || []).length ? 'No Xola payout of this amount found' : 'No Xola payouts loaded') : 'Not a Xola payout'}. Administrative selected.`;
           trace.push('Platform payout: no location match. Administrative by default.');
         }
         return out;
@@ -793,7 +793,7 @@ const Engine = (() => {
         const conf = isConfirmed(r), f = eff(r);
         return { id: r.id, date: r.date, dateRaw: r.dateRaw, desc: r.desc, vendor: f.vendor, gl: f.gl, cls: f.cls, amount: r.amount,
           account: r.account ? r.account.name : '', accNum: r.account ? r.account.num : '', accCard: !!(r.account && r.account.card), cur: r.account ? r.account.cur : '', topGl: conf ? 0 : (r.topGl || 0),
-          memo: conf ? 'Confirmed by ' + (r.resolved.by || 'team member') + (r.resolved.loc ? ' | Location: ' + r.resolved.loc.replace(/_/g, ' ') : '') : 'Auto: ' + r.source,
+          memo: conf ? (r.resolved.auto ? 'Xola payout matched by amount' : 'Confirmed' + (r.resolved.by ? ' by ' + r.resolved.by : '')) + (r.resolved.loc ? ' | Location: ' + r.resolved.loc.replace(/_/g, ' ') : '') : 'Auto: ' + r.source,
           adminReview: conf ? isAdminClass(f.cls) : !!r.adminReview,
           newVendor: !!r.newVendor, limited: !!r.limited, steven: !!r.steven, lane: r.lane };
       });
@@ -1041,13 +1041,13 @@ async function restDb(){
 async function cloudStart(){
   let db = null;
   try{ db = await getDb(); }catch(e){ db = null; }
-  if(!db){ renderPill(); return; }
+  if(!db){ renderPill(); autoXola(); return; }
   CL.db = db; CL.waiting = 0; renderPill();
   const onErr = e => { if(e && e.code === 'revoked'){ CL.db = null; } renderPill(); };
   const docKeys = ['team/cfg','team/coa','team/classes','team/bills','master/meta'];
   const colls = {masterrows:'masterrows', added:'added', emailrules:'emailrules', bankrules:'bankrules', nvlog:'nvlog', payroll:'payroll'};
   CL.waiting = docKeys.length + Object.keys(colls).length;
-  const first = k => { if(!CL.seen[k]){ CL.seen[k] = true; if(--CL.waiting === 0){ CL.ready = true; applyAll(true); renderPill(); if(CL.want) cloudPush(); } } };
+  const first = k => { if(!CL.seen[k]){ CL.seen[k] = true; if(--CL.waiting === 0){ CL.ready = true; applyAll(true); renderPill(); if(CL.want) cloudPush(); autoXola(); } } };
   docKeys.forEach(p => db.doc(p).onSnapshot(s => { CL.snap[p] = s.exists ? JSON.parse(JSON.stringify(s.data())) : null; got(p); first(p); }, onErr));
   Object.values(colls).forEach(c => db.collection(c).onSnapshot(s => { CL.snap[c] = s.docs.map(d => Object.assign({_id:d.id}, JSON.parse(JSON.stringify(d.data())))); got(c); first(c); }, onErr));
 }
@@ -1168,13 +1168,26 @@ function process(){
   S.txs = [];
   S.feeds.forEach((f, i) => { if(f.acctIdx >= 0){ const t = Engine.loadFeed(f.text, acctFor(f), 'f'+f.id, S.forced); f.count = t.length; S.txs.push(...t); } });
   S.results = Engine.run(S.txs, cfgAll());
-  S.drafts = {}; S.acks = {}; S.signed = null; S.open = {};
+  S.drafts = {}; S.acks = {}; S.signed = null; S.open = {}; S.noAuto = {}; S.seenResolve = false;
+  applyAuto();
+}
+/* A payout whose amount matches exactly one Xola payout (with a known class) needs no decision: it is confirmed automatically. */
+function applyAuto(){
+  S.noAuto = S.noAuto || {};
+  S.results.forEach(r => {
+    if(!r.autoConfirm || r.resolved || S.noAuto[r.id]) return;
+    const o = (r.payoutOptions||[])[0]; if(!o) return;
+    const loc = o.locs.join(', ');
+    r.resolved = o.personal ? {confirmed:true, auto:true, personal:true, loc, vendor:r.platform, gl:'Steven personal book', cls:'', isNewVendor:false}
+                            : {confirmed:true, auto:true, loc, vendor:r.platform, gl:r.gl, cls:r.cls, isNewVendor:false};
+  });
 }
 function rerun(){
   const keep = new Map(S.results.map(r => [r.id, r.resolved]));
   S.txs = []; S.feeds.forEach(f => { if(f.acctIdx >= 0) S.txs.push(...Engine.loadFeed(f.text, acctFor(f), 'f'+f.id, S.forced)); });
   S.results = Engine.run(S.txs, cfgAll());
   S.results.forEach(r => r.resolved = keep.get(r.id) || null);
+  applyAuto();
   const proposed = new Set(S.cfg.newVendorLog.filter(v => v.status==='proposed').map(v => Engine.norm(v.vendor)));
   S.results.forEach(r => { if((r.resolved && r.resolved.isNewVendor) || (r.lane!=='scope' && r.lane!=='bill' && proposed.has(Engine.norm(r.qboVendor||r.vendor||'')))) r.newVendor = true; });
   S.signed = null;
@@ -1208,11 +1221,11 @@ function renderSteps(){
   const w = waiting().length;
   const steps = [['upload','Upload'],['results','Results'],['resolve','Resolve'],['review','Review'],['export','Export']];
   $('#steps').innerHTML = steps.map(([k, l], i) => {
-    const done = (k==='upload' && S.txs.length) || (k==='resolve' && S.txs.length && w===0) || (k==='review' && S.signed);
+    const done = (k==='upload' && S.txs.length) || (k==='results' && S.txs.length && S.seenResolve) || (k==='resolve' && S.txs.length && w===0) || (k==='review' && S.signed);
     return `<button class="step ${done?'done':''}" data-view="${k}" ${S.view===k?'aria-current="page"':''}><span class="n">${done?'✓':i+1}</span>${l}${k==='resolve'&&w?`<span class="badge">${w}</span>`:''}</button>`;
   }).join('');
   $('#dataBtn').style.borderColor = S.view==='data' ? 'var(--accent)' : '';
-  $('#auditBtn').style.borderColor = S.view==='audit' ? 'var(--accent)' : '';
+  
 }
 
 /* ---------- views ---------- */
@@ -1231,22 +1244,36 @@ function readinessRows(){
       : dot('warn', 'Open bills', 'Not loaded. Vendors that had bills in the last 90 days are held, because a bill payment cannot be ruled out.', '<button class="btn small" data-goto-data="bills">Upload</button>')
   ].join('');
 }
+function xolaStatus(){
+  const n = (S.cfg.payoutIndex||[]).length, x = S.xola || {st:'idle'};
+  if(x.st==='load') return `<span class="sub">Updating from Xola…</span>`;
+  if(x.st==='ok') return `<span class="sub">${n} payouts, updated ${esc(x.at)}</span>`;
+  if(x.st==='off') return `<span class="sub">${n?n+' payouts saved':'Not connected'}. Updates by itself on the web address.</span>`;
+  if(x.st==='err') return `<span class="sub">Could not update (${esc(x.msg)}). ${n?'Using '+n+' saved payouts.':''}</span>`;
+  return `<span class="sub">${n?n+' payouts saved':'Waiting to start'}</span>`;
+}
 function vUpload(){
   const feeds = S.feeds.map(f => `<div class="feed"><div><b>${esc(f.name)}</b><div class="sub">${f.count!=null && f.acctIdx>=0 ? f.count+' transactions' : 'Choose the account'}</div></div>
-    <label class="f">Account this file came from<select data-feed-acct="${f.id}"><option value="-1">Choose account</option>${ACCOUNTS.map((a,i)=>`<option value="${i}" ${f.acctIdx===i?'selected':''}>${esc(a.num+' '+a.name)}</option>`).join('')}</select></label>
+    <label class="f">Account<select data-feed-acct="${f.id}"><option value="-1">Choose account</option>${ACCOUNTS.map((a,i)=>`<option value="${i}" ${f.acctIdx===i?'selected':''}>${esc(a.num+' '+a.name)}</option>`).join('')}</select></label>
     <button class="btn small ghost" data-feed-del="${f.id}">Remove</button></div>`).join('');
   const can = S.feeds.length && S.feeds.every(f => f.acctIdx >= 0);
+  const up = (id, label, accept, multi) => `<span class="filebtn btn small">${label}<input type="file" id="${id}" accept="${accept}" ${multi?'multiple':''}></span>`;
+  const br = S.cfg.openBills.length, fresh = S.cfg.billsAt===today();
+  const billsTxt = br ? `${new Set(S.cfg.openBills.map(b=>b.vendor)).size} vendors with open bills${fresh?'':' (not from today, upload again)'}` : S.cfg.noOpenBills ? 'No open bills today' : 'Not loaded. Upload the A/P Aging report.';
+  const mWarn = !S.master.length ? `<div class="banner warn"><span><b>Vendor Master not loaded.</b> Every vendor will look new.</span><button class="btn small" data-goto-data="master">Upload it</button></div>` : '';
   return `
-  <div class="pagehead"><div><h2>Upload the bank feed</h2><p>Add one CSV per account. They are combined into one working file (SOP step 1). Everything runs in your browser.</p></div></div>
-  <div class="upgrid">
-    <div class="card" style="display:flex;flex-direction:column;gap:12px">
-      <h3 style="font-size:16px">Bank feed files</h3>
-      <label class="drop" id="drop"><b>Drop files here</b><span class="sub">or click to choose. Columns: Date, DESCRIPTION, Payee, Categorize or match, Class, SPENT, RECEIVED</span><input type="file" id="file" accept=".csv,text/csv" multiple hidden></label>
-      <div>${feeds || '<div class="sub">No files yet.</div>'}</div>
-      <div class="row"><button class="btn primary" id="processBtn" ${can?'':'disabled'}>Process ${S.feeds.length||''} file${S.feeds.length===1?'':'s'}</button>${S.feeds.length && !can?'<span class="sub">Choose an account for every file.</span>':''}</div>
-    </div>
-    <div class="card"><h3 style="font-size:16px;margin-bottom:6px">Before you process</h3><div class="ready">${readinessRows()}</div></div>
-  </div>`;
+  <div class="pagehead"><div><h2>Upload</h2><p>One CSV per account, plus today's open bills.</p></div><button class="btn" id="auditBtn">Review File</button></div>
+  ${mWarn}
+  <div class="card" style="display:flex;flex-direction:column;gap:12px">
+    <h3 style="font-size:16px">Bank feed files</h3>
+    <label class="drop" id="drop"><b>Drop files here</b><span class="sub">or click to choose</span><input type="file" id="file" accept=".csv,text/csv" multiple hidden></label>
+    ${S.feeds.length?`<div>${feeds}</div>`:''}
+  </div>
+  <div class="card" style="display:flex;flex-direction:column;gap:4px">
+    <div class="rd"><span class="dot ${br&&fresh||S.cfg.noOpenBills?'ok':'warn'}"></span><span><b>Open bills</b><div class="sub">${billsTxt}</div></span><span class="row">${up('upBills', br?'Replace':'Upload', '.xlsx,.xls,.csv')}<button class="btn small ghost" data-nobills="1">${S.cfg.noOpenBills?'Undo':'None today'}</button></span></div>
+    <div class="rd"><span class="dot ${(S.xola||{}).st==='ok'?'ok':(S.xola||{}).st==='err'?'bad':'warn'}"></span><span><b>Xola payouts</b><div>${xolaStatus()}</div></span>${up('upXola', 'Upload report', '.xlsx,.xls,.csv', true)}</div>
+  </div>
+  <div class="row"><button class="btn primary" id="processBtn" ${can?'':'disabled'}>Process ${S.feeds.length||''} file${S.feeds.length===1?'':'s'}</button>${S.feeds.length && !can?'<span class="sub">Choose an account for every file.</span>':''}</div>`;
 }
 
 function chipsFor(r){
@@ -1304,21 +1331,21 @@ function clsSelect(id, value, allowOwner){
 const payoutLocs = () => S.cfg.payoutLocations || Engine.DEFAULT_PAYOUT_LOCATIONS;
 function payoutBlock(r, d){
   const o = r.payoutOptions || [], n = (S.cfg.payoutIndex||[]).length;
-  if(!o.length) return `<div class="picks"><span class="lbl">${r.platform==='Xola' ? (n ? 'No Xola payout of this amount was found.' : 'No Xola payouts are loaded (Data &amp; rules, Xola payouts).') : 'Class cannot be read from the bank line.'} Administrative is the default. Change the class below if you know it.</span></div>`;
+  if(!o.length) return '';
   const chips = o.map((x,i) => { const sel = x.personal ? d.personal : (!d.personal && d.cls && d.cls===x.cls); return `<button type="button" class="pick" aria-pressed="${sel?'true':'false'}" ${sel?'style="outline:2px solid var(--accent,#2563eb)"':''} data-pick-opt="${r.id}" data-i="${i}">${x.personal?'Steven personal book':esc(x.cls||'Class not in the SOP table')} <span class="sub">${esc(x.locs.map(l=>l.replace(/_/g,' ')).join(', '))}${x.dates.length?' · paid '+esc(x.dates.join(', ')):''}</span></button>`; }).join('');
-  return `<div class="picks"><span class="lbl">${o.length>1?'Same amount in several Xola locations. Choose the class:':'Matching Xola payout:'}</span>${chips}</div>`;
+  return `<div class="picks"><span class="lbl">${o.length>1?'Same amount in several locations. Choose:':'Matching payout:'}</span>${chips}</div>`;
 }
 function draftFor(r){
-  if(!S.drafts[r.id]) S.drafts[r.id] = { vendor: r.qboVendor || r.vendor || r.platform || '', gl: r.gl || '', loc: (r.payoutOptions&&r.payoutOptions.length===1) ? r.payoutOptions[0].locs.join(', ') : '', personal: !!(r.payoutOptions&&r.payoutOptions.length===1&&r.payoutOptions[0].personal), cls: (r.cls && !/^run class/i.test(r.cls)) ? r.cls : (r.adminDefault ? (S.cfg.classMap.Administrative || Engine.DEFAULT_CLASS_MAP.Administrative) : r.pickClass ? '' : r.proposedClass) };
+  if(!S.drafts[r.id]) S.drafts[r.id] = { vendor: r.qboVendor || r.vendor || r.platform || '', gl: r.gl || r.suggestedGL || '', loc: (r.payoutOptions&&r.payoutOptions.length===1) ? r.payoutOptions[0].locs.join(', ') : '', personal: !!(r.payoutOptions&&r.payoutOptions.length===1&&r.payoutOptions[0].personal), cls: (r.cls && !/^run class/i.test(r.cls)) ? r.cls : (r.adminDefault ? (S.cfg.classMap.Administrative || Engine.DEFAULT_CLASS_MAP.Administrative) : r.pickClass ? '' : r.proposedClass) };
   return S.drafts[r.id];
 }
 function vResolve(){
   if(!ready()) return noData('Resolve');
-  const list = S.results.filter(r => r.lane==='new' || r.lane==='exception' || conf(r));
+  const autoN = S.results.filter(r => conf(r) && r.resolved.auto).length;
+  const list = S.results.filter(r => (r.lane==='new' || r.lane==='exception' || conf(r)) && !(conf(r) && r.resolved.auto && !S.showAuto));
   const actionable = list.filter(r => Engine.canConfirm(r) || conf(r));
   const done = actionable.filter(r => conf(r)).length;
-  if(!list.length) return `<div class="pagehead"><div><h2>Resolve</h2></div></div><div class="card empty"><b>Nothing is waiting for a decision.</b>Every row was matched with confidence, sent to the bill list, or is out of scope.<br><br><button class="btn primary" data-view="review">Go to review</button></div>`;
-  const member = `<div class="card row" style="justify-content:space-between"><label class="f" style="min-width:min(100%,260px)">Team member name<input type="text" id="member" value="${esc(S.member)}" placeholder="e.g. Arjun Kapoor"></label><span class="sub" style="max-width:56ch">Recorded in the Memo of every row you confirm. A new vendor you confirm is added to the Vendor Master and the New Vendor Log automatically.</span></div>`;
+  if(!list.length) return `<div class="pagehead"><div><h2>Resolve</h2></div></div><div class="card empty"><b>Nothing is waiting for a decision.</b>Every row was matched with confidence, sent to the bill list, or is out of scope.${autoN?` ${autoN} Xola payout${autoN===1?'':'s'} matched by amount automatically.`:''}<br><br><button class="btn primary" data-view="review">Go to review</button></div>`;
   const cards = list.map(r => {
     const ok = conf(r); const held = r.lane==='exception' && !Engine.canConfirm(r);
     const d = ok || held ? null : draftFor(r);
@@ -1332,17 +1359,18 @@ function vResolve(){
       const gls = suggestGl.map((g,i) => `<button class="pick" data-pick-gl="${r.id}" data-g="${esc(g)}">${esc(g)}</button>`).join('');
       body = `${sim?`<div class="picks"><span class="lbl">Existing vendors that may match:</span>${sim}</div>`:''}
       ${r.payout?payoutBlock(r,d):''}
-      <div class="two"><label class="f">Vendor (exact QBO name)<input type="text" list="vlist" data-d="${r.id}" data-k="vendor" value="${esc(d.vendor)}"><span class="hint">${r.account.cur==='GBP'?'Wise GBP vendors end in _G.':r.account.cur==='EUR'?'Euro vendors end in _E.':'Use the name exactly as in QBO.'}</span></label>
-      <label class="f">Class${clsSelect(r.id, d.cls, r.steven)}<span class="hint">${r.proposedWhy?'Proposed from '+esc(r.proposedWhy):''}</span></label></div>
+      <div class="two"><label class="f">Vendor (exact QBO name)<input type="text" list="vlist" data-d="${r.id}" data-k="vendor" value="${esc(d.vendor)}"><span class="hint">${r.payout?'':r.account.cur==='GBP'?'Wise GBP vendors end in _G.':r.account.cur==='EUR'?'Euro vendors end in _E.':'Use the name exactly as in QBO.'}</span></label>
+      <label class="f">Class${clsSelect(r.id, d.cls, r.steven)}<span class="hint">${r.proposedWhy&&!r.payout?'Proposed from '+esc(r.proposedWhy):''}</span></label></div>
       <label class="f">GL account<div class="glrow"><input type="search" placeholder="Filter accounts" data-filter-gl="${r.id}">${glSelect(r.id, d.gl, suggestGl)}</div></label>
       ${gls?`<div class="picks"><span class="lbl">${r.suggestGls&&r.suggestGls.length?'Accounts this vendor has used:':'QBO suggested:'}</span>${gls}</div>`:''}
       <div class="row" style="justify-content:flex-end"><button class="btn primary" data-confirm="${r.id}">Confirm</button></div>`;
     }
-    return `<div class="card rc ${ok?'done':''} ${r.newVendor&&!ok?'isnew':''}" data-card="${r.id}">${head}<div class="whybox">${esc(r.reason)}</div>${body}</div>`;
+    return `<div class="card rc ${ok?'done':''} ${r.newVendor&&!ok?'isnew':''}" data-card="${r.id}">${head}${r.payout&&!ok?'':`<div class="whybox">${esc(r.reason)}</div>`}${body}</div>`;
   }).join('');
+  const autoBar = autoN ? `<div class="banner"><span><b>${autoN} Xola payout${autoN===1?'':'s'}</b> matched by amount and confirmed automatically.</span><button class="btn small" data-toggle-auto="1">${S.showAuto?'Hide':'Show'}</button></div>` : '';
   return `
   <div class="pagehead"><div><h2>Resolve what the rules could not</h2><p>Identify the real vendor, choose the account and class from the full lists, then confirm. Nothing is guessed: rows you do not confirm stay out of the import.</p></div><div class="row"><progress max="${actionable.length||1}" value="${done}"></progress><span class="sub num">${done} of ${actionable.length} confirmed</span></div></div>
-  ${member}
+  ${autoBar}
   <div class="rcards">${cards}</div>
   <datalist id="vlist">${S.master.map(m=>`<option value="${esc(m.vendor)}">`).join('')}</datalist>
   ${actionable.length && done===actionable.length?`<div class="row"><button class="btn primary" data-view="review">Continue to review</button></div>`:''}`;
@@ -1431,7 +1459,7 @@ function vAudit(){
     <div class="tablewrap"><table><thead><tr><th>Date</th><th>Payee</th><th class="r">Amount</th><th>In the file</th><th>SOP says</th><th>Result</th></tr></thead><tbody>${lines || '<tr><td colspan="6" class="empty">Nothing in this group.</td></tr>'}</tbody></table></div>
     ${shown.length > 400 ? `<div class="sub">Showing the first 400 of ${shown.length}. The Excel report has every row.</div>` : ''}` : '';
   return `
-  <div class="pagehead"><div><h2>Check an older categorised file</h2><p>Upload a file that was categorised by hand (for example a QuickBooks bank feed export that shows what each line was added or matched to). Each line is run through the SOP and compared with what the file has. Nothing is posted, imported or changed.</p></div></div>
+  <div class="pagehead"><div><h2>Review File</h2><p>Upload a file that was categorised by hand. Each line is checked against the SOP and compared. Nothing is posted or changed.</p></div></div>
   <div class="card" style="display:flex;flex-direction:column;gap:12px">
     <div class="row">
       <label class="drop" id="adrop" style="flex:1;min-width:260px;position:relative"><b>${A.name ? esc(A.name) : 'Drop the categorised file here'}</b><span class="sub">or click to choose. CSV with Date, DESCRIPTION, AMOUNT, Payee and either "ADDED OR MATCHED" or a GL account / Class column.</span><input type="file" id="auditFile" accept=".csv,text/csv" style="position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%"></label>
@@ -1515,8 +1543,6 @@ function vData(){
     <div class="card dcard"><h3>Vendor Master</h3><p>${m?`${m} vendors${S.mMeta?' from '+esc(S.mMeta.file)+', loaded '+esc(S.mMeta.at):''}.`:'Not loaded. Upload the Empire Vendor Master workbook once. It is saved for the team when team storage is on, otherwise in this browser.'}</p>${m?`<div>${tierBreakdown()}</div>`:''}<div class="row">${up('upMaster', m?'Replace Vendor Master':'Upload Vendor Master', '.xlsx,.xls,.csv')}${m?'<button class="btn small" data-export="master">Save updated Excel</button>':''}</div></div>
     <div class="card dcard"><h3>Chart of accounts</h3><p>${S.coaSource==='upload'?`${S.coa.length} accounts from your upload. These fill every GL dropdown and are used to check accounts.`:`Using ${S.derived.gls.length} account names taken from the Vendor Master. Upload the full chart (QBO Account List, CSV or Excel) to get every account with its number.`}</p><div class="row">${up('upCoa', 'Upload chart of accounts', '.xlsx,.xls,.csv')}${S.coaSource==='upload'?'<button class="btn small ghost" data-clear="coa">Clear</button>':''}</div></div>
     <div class="card dcard"><h3>Classes</h3><p>${S.classSource==='upload'?`${S.classesUp.length} classes from your upload.`:`Using ${S.derived.classes.length} classes taken from the Vendor Master. Upload the full class list to get every class.`}</p><div class="row">${up('upClasses', 'Upload classes', '.xlsx,.xls,.csv')}${S.classSource==='upload'?'<button class="btn small ghost" data-clear="classes">Clear</button>':''}</div></div>
-    <div class="card dcard" id="xolaCard"><h3>Xola payouts</h3><p>${(S.cfg.payoutIndex||[]).length?`${S.cfg.payoutIndex.length} payouts from ${new Set(S.cfg.payoutIndex.map(x=>x.loc)).size} locations.`:'Not loaded. A Xola deposit is matched to its location by amount, which gives the class.'}</p><div class="row"><button class="btn small" id="xolaFetch">Fetch from Xola</button><button class="btn small" id="xolaList">Show Xola locations (for XOLA_SELLERS)</button><span class="filebtn btn small">Upload Payouts Reports<input type="file" id="upXola" accept=".xlsx,.xls,.csv" multiple></span></div></div>
-    <div class="card dcard" id="billsCard"><h3>Open bills</h3><p>${S.cfg.openBills.length?`Open balances for ${new Set(S.cfg.openBills.map(b=>b.vendor)).size} vendors, loaded ${esc(S.cfg.billsAt||'')}. Kept for today only.`:S.cfg.noOpenBills?'You confirmed there are no open bills.':'Upload the QuickBooks A/P Aging report (Summary or Detail, CSV or Excel) each day. Vendors with an open balance are read automatically.'}</p><div class="row">${up('upBills', 'Upload open bills', '.xlsx,.xls,.csv')}<button class="btn small" data-nobills="1">${S.cfg.noOpenBills?'Undo: there are open bills':'There are no open bills today'}</button></div></div>
   </div>`;
   let body;
   const tab = S.dataTab;
@@ -1564,7 +1590,7 @@ function render(){
   window.scrollTo(0, y);
   if(focus==='mSearch'||focus==='rSearch'||focus==='aSearch'){ const el = $('#'+focus); if(el){ el.focus(); el.setSelectionRange(el.value.length, el.value.length); } }
 }
-function go(v){ S.view = v; render(); window.scrollTo(0, 0); }
+function go(v){ S.view = v; if(v==='resolve'||v==='review'||v==='export') S.seenResolve = true; render(); window.scrollTo(0, 0); }
 
 /* ---------- file reading ---------- */
 const readText = f => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result)); r.onerror = rej; r.readAsText(f); });
@@ -1712,41 +1738,30 @@ async function importXola(files){
       n += g.size;
     }catch(e){ bad.push(f.name + ': ' + (e.message||'could not be read')); }
   }
-  S.dataTab = 'payoutIndex';
+  if(n) S.xola = {st:'ok', at:'from your report'};
   toast(n ? `Xola payouts loaded: ${n} payout${n===1?'':'s'}.${bad.length?' Skipped: '+bad.join('; '):''}` : (bad.join('; ') || 'No payouts found.'));
 }
-async function xolaList(){
+let XOLA_P = null, XOLA_AT = 0;
+/* Payouts are read from Xola by itself: when the page opens, and again when files are processed if the list is old. */
+function autoXola(){
+  if(XOLA_P) return XOLA_P;
+  if(!/^https?:$/.test(location.protocol)){ S.xola = {st:'off'}; return Promise.resolve(); }
   let key = ''; try{ key = localStorage.getItem('empire-key') || ''; }catch(e){}
-  if(!/^https?:$/.test(location.protocol)) return toast('This works on the web address (Vercel), not in a saved file.');
-  try{
-    const r = await fetch('/api/xola', {method:'POST', headers:{'content-type':'application/json','x-app-key':key}, body:JSON.stringify({list:true})});
-    const j = await r.json().catch(() => ({}));
-    if(!r.ok) return toast(j.error || ('Xola request failed (' + r.status + ').'));
-    const L = j.sellers || []; if(!L.length) return toast(j.note || 'Xola returned no locations for this key.');
-    const map = {}, unk = [];
-    L.forEach(s => { const f = Engine.findLoc(s.name, S.cfg); if(f) map[f.name] = s.id; else { map[String(s.name).replace(/\s+/g,'_')] = s.id; unk.push(s.name); } });
-    const txt = JSON.stringify(map, null, 1);
-    const o = document.createElement('div'); o.className = 'keyov';
-    o.innerHTML = `<div class="card keybox" style="max-width:640px"><h3>XOLA_SELLERS</h3><p class="sub">${L.length} Xola locations found. Copy this whole text into Vercel as the value of XOLA_SELLERS, then redeploy.${unk.length?' Not in the SOP table (check the spelling): '+esc(unk.join(', '))+'.':' All names match the SOP table.'}</p><textarea id="selTxt" rows="12" style="width:100%;font-family:monospace;font-size:12px" readonly>${esc(txt)}</textarea><div class="row" style="justify-content:flex-end"><button class="btn" id="selCopy">Copy</button><button class="btn primary" id="selClose">Close</button></div></div>`;
-    document.body.appendChild(o);
-    o.querySelector('#selCopy').onclick = () => copyText(txt, 'Copied');
-    o.querySelector('#selClose').onclick = () => o.remove();
-  }catch(e){ toast('Could not reach Xola: ' + (e.message||e)); }
-}
-async function xolaFetch(){
-  let key = ''; try{ key = localStorage.getItem('empire-key') || ''; }catch(e){}
-  if(!/^https?:$/.test(location.protocol)) return toast('Fetching from Xola works on the web address (Vercel), not in a saved file.');
-  toast('Asking Xola for payouts…');
-  try{
-    const from = new Date(Date.now() - 60*864e5).toISOString().slice(0,10);
-    const r = await fetch('/api/xola', {method:'POST', headers:{'content-type':'application/json','x-app-key':key}, body:JSON.stringify({from})});
-    const j = await r.json().catch(() => ({}));
-    if(!r.ok) return toast(j.error || ('Xola request failed (' + r.status + ').'));
-    if(!(j.entries||[]).length) return toast((j.note || 'Xola returned no payouts.') + (j.errors&&j.errors.length?' '+j.errors.join('; '):''));
-    const norm = j.entries.map(e => { const f = Engine.findLoc(e.loc, S.cfg); return {loc: f ? f.name : e.loc, date:e.date, net:e.net}; });
-    mergePayouts(norm, 'Xola API'); S.dataTab = 'payoutIndex'; render();
-    toast(`Xola: ${norm.length} payouts from ${new Set(norm.map(x=>x.loc)).size} locations.${j.errors&&j.errors.length?' Problems: '+j.errors.join('; '):''}`);
-  }catch(e){ toast('Could not reach Xola: ' + (e.message||e)); }
+  S.xola = {st:'load'}; if(S.view==='upload') render();
+  XOLA_P = (async () => {
+    try{
+      const from = new Date(Date.now() - 60*864e5).toISOString().slice(0,10);
+      const r = await fetch('/api/xola', {method:'POST', headers:{'content-type':'application/json','x-app-key':key}, body:JSON.stringify({from})});
+      const j = await r.json().catch(() => ({}));
+      if(!r.ok) throw new Error(r.status===404 ? 'not set up on this site' : (j.error || ('error '+r.status)));
+      if(!(j.entries||[]).length) throw new Error(j.note || 'no payouts returned');
+      const norm = j.entries.map(e => { const f = Engine.findLoc(e.loc, S.cfg); return {loc: f ? f.name : e.loc, date:e.date, net:e.net}; });
+      mergePayouts(norm, 'Xola API');
+      XOLA_AT = Date.now(); S.xola = {st:'ok', at:new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})};
+    }catch(e){ S.xola = {st:'err', msg:String(e.message||e).slice(0,80)}; }
+    finally{ XOLA_P = null; if(S.view==='upload') render(); }
+  })();
+  return XOLA_P;
 }
 async function importPayroll(f){
   const {sheets, names} = await readSheets(f);
@@ -1859,8 +1874,7 @@ function weeklyNote(){
 /* ---------- events ---------- */
 function confirmRow(id){
   const r = S.results.find(x => x.id===id), dr = S.drafts[id];
-  if(!S.member.trim()) return toast('Enter the team member name first.');
-  if(r.payout && dr.personal){ r.resolved = {confirmed:true, personal:true, loc:dr.loc, vendor:dr.vendor||r.platform, gl:'Steven personal book', cls:'', by:S.member.trim(), isNewVendor:false}; S.signed = null; render(); return toast('Confirmed. This payout belongs to Steven\'s personal book and is on the Steven personal list, not the Empire import.'); }
+  if(r.payout && dr.personal){ r.resolved = {confirmed:true, personal:true, loc:dr.loc, vendor:dr.vendor||r.platform, gl:'Steven personal book', cls:'', by:S.member.trim()||'', isNewVendor:false}; S.signed = null; render(); return toast('Confirmed. This payout belongs to Steven\'s personal book and is on the Steven personal list, not the Empire import.'); }
   if(!dr.vendor.trim() || !dr.gl.trim() || !dr.cls.trim()) return toast('Vendor, GL account and class are all required.');
   if(Engine.isOwnerClass(dr.cls) && !r.steven) return toast('"Owner Distribution" is not used for Empire transactions. Steven personal charges are handled by the Vendor Master rule.');
   if(Engine.isRetiredClass(dr.cls)) return toast('That class is not used. Use Empire Tours:Chicago instead.');
@@ -1868,7 +1882,7 @@ function confirmRow(id){
   const vend = dr.vendor.trim();
   if(!r.payout && !r.steven && !S.mHeader.length && !S.master.some(m => Engine.norm(m.vendor)===Engine.norm(vend))) return toast('Load the Vendor Master first, so a new vendor can be added to it.');
   const isNew = !r.payout && !r.steven && !S.master.some(m => Engine.norm(m.vendor)===Engine.norm(vend));
-  r.resolved = {confirmed:true, vendor:vend, gl:dr.gl.trim(), cls:dr.cls.trim(), by:S.member.trim(), isNewVendor:isNew, loc:r.payout?dr.loc:''};
+  r.resolved = {confirmed:true, vendor:vend, gl:dr.gl.trim(), cls:dr.cls.trim(), by:S.member.trim()||'', isNewVendor:isNew, loc:r.payout?dr.loc:''};
   let extra = 0;
   if(isNew){
     const ix = Engine.masterIndex([S.mHeader]); const raw = new Array(S.mHeader.length).fill('');
@@ -1876,9 +1890,9 @@ function confirmRow(id){
     set('vendor', vend); set('file', 'Empire'); set('tier', 'B. Auto-match ready (GL + class fixed)'); set('gl', dr.gl.trim()); set('cls', dr.cls.trim());
     set('autoMatch', 'Yes - limited history (<3 txns)'); set('howTo', 'Apply this GL and class directly. Safe for bank rule / auto-match.'); set('topGl', '100%'); set('topCls', '100%');
     set('usualAcct', r.account.name); set('lastDate', r.dateRaw); set('txns', 1); set('spend', Math.abs(r.amount));
-    set('bills', 'No'); set('notes', `NEW vendor proposed by ${S.member.trim()} on ${today()}. Awaiting Jonathan's confirmation.`);
-    S.mAdded.push({_id:rid(), vendor:vend, raw, by:S.member.trim(), at:today()});
-    S.cfg.newVendorLog.push({_id:rid(), vendor:vend, gl:dr.gl.trim(), cls:dr.cls.trim(), date:today(), by:S.member.trim(), status:'proposed'});
+    set('bills', 'No'); set('notes', `NEW vendor proposed${S.member.trim()?' by '+S.member.trim():''} on ${today()}. Awaiting Jonathan's confirmation.`);
+    S.mAdded.push({_id:rid(), vendor:vend, raw, by:S.member.trim()||'', at:today()});
+    S.cfg.newVendorLog.push({_id:rid(), vendor:vend, gl:dr.gl.trim(), cls:dr.cls.trim(), date:today(), by:S.member.trim()||'', status:'proposed'});
     rebuildMaster(); saveAll();
     const before = S.results.filter(x => x.lane==='old' && x.id!==id).length;
     rerun();
@@ -1888,12 +1902,12 @@ function confirmRow(id){
   toast(isNew ? `Confirmed. ${vend} was added to the Vendor Master and the New Vendor Log.${extra>0?` ${extra} other row(s) now match automatically.`:''}` : 'Confirmed');
 }
 
-document.addEventListener('click', e => {
-  const t = e.target.closest('[data-view],[data-filter],[data-open],[data-confirm],[data-undo],[data-add],[data-del],[data-dtab],[data-export],[data-save-list],[data-force],[data-goto-data],[data-pick-vendor],[data-pick-opt],[data-pick-gl],[data-clear],[data-nobills],[data-feed-del],button');
+document.addEventListener('click', async e => {
+  const t = e.target.closest('[data-view],[data-filter],[data-open],[data-confirm],[data-undo],[data-add],[data-del],[data-dtab],[data-export],[data-save-list],[data-force],[data-goto-data],[data-pick-vendor],[data-pick-opt],[data-toggle-auto],[data-pick-gl],[data-clear],[data-nobills],[data-feed-del],button');
   if(!t) return;
   const d = t.dataset;
   if(d.view) return go(d.view);
-  if(d.gotoData){ S.dataTab = d.gotoData==='master' ? 'master' : d.gotoData==='bills' ? 'openBills' : 'master'; return go('data'); }
+  if(d.gotoData){ if(d.gotoData==='bills') return go('upload'); S.dataTab = 'master'; return go('data'); }
   if(d.filter){ S.filter = S.filter===d.filter && d.filter!=='all' ? 'all' : d.filter; return render(); }
   if(d.open){ S.open[d.open] = !S.open[d.open]; return render(); }
   if(d.saveList) return doExport(d.saveList);
@@ -1905,8 +1919,9 @@ document.addEventListener('click', e => {
   if(d.del!==undefined){ S.cfg[S.dataTab].splice(+d.del, 1); saveAll(); rerun(); return render(); }
   if(d.clear){ if(d.clear==='coa'){ S.coa = []; S.coaSource = ''; rerun(); } else { S.classesUp = []; S.classSource = ''; } saveAll(); return render(); }
   if(d.nobills){ S.cfg.noOpenBills = !S.cfg.noOpenBills; if(S.cfg.noOpenBills){ S.cfg.openBills = []; } saveAll(); rerun(); return render(); }
-  if(d.undo){ const r = S.results.find(x => x.id===d.undo); r.resolved = null; S.signed = null; return render(); }
+  if(d.undo){ const r = S.results.find(x => x.id===d.undo); r.resolved = null; (S.noAuto = S.noAuto||{})[r.id] = true; S.signed = null; return render(); }
   if(d.pickOpt){ const r = S.results.find(x=>x.id===d.pickOpt), x = r.payoutOptions[+d.i], dr = S.drafts[r.id]; dr.personal = !!x.personal; dr.cls = x.personal ? '' : x.cls; dr.loc = x.locs.join(', '); return render(); }
+  if(d.toggleAuto){ S.showAuto = !S.showAuto; return render(); }
   if(d.confirm) return confirmRow(d.confirm);
   if(d.pickVendor){
     const r = S.results.find(x => x.id===d.pickVendor), s = r.suggest[+d.i], dr = S.drafts[r.id], card = t.closest('.rc');
@@ -1917,10 +1932,8 @@ document.addEventListener('click', e => {
   }
   if(d.pickGl){ const dr = S.drafts[d.pickGl], card = t.closest('.rc'), sel = card.querySelector('[data-k=gl]'); dr.gl = d.g; if(![...sel.options].some(o => o.value===d.g)){ const o = document.createElement('option'); o.value = d.g; o.textContent = d.g; sel.appendChild(o); } sel.value = d.g; return; }
   if(t.id==='dataBtn') return go('data');
-  if(t.id==='processBtn'){ process(); if(!S.txs.length) return toast('No transactions found. Check the column headers (Date, DESCRIPTION, Payee, SPENT, RECEIVED).'); S.filter = 'all'; go('results'); return toast(`Loaded ${S.txs.length} transactions from ${S.feeds.length} file${S.feeds.length===1?'':'s'}`); }
+  if(t.id==='processBtn'){ t.disabled = true; t.textContent = 'Working…'; if(XOLA_P || Date.now()-XOLA_AT > 20*60e3) await Promise.race([autoXola(), new Promise(r => setTimeout(r, 25000))]); process(); if(!S.txs.length) return toast('No transactions found. Check the column headers (Date, DESCRIPTION, Payee, SPENT, RECEIVED).'); S.filter = 'all'; go('results'); return toast(`Loaded ${S.txs.length} transactions from ${S.feeds.length} file${S.feeds.length===1?'':'s'}`); }
   if(t.id==='signBtn'){ S.signed = {by:S.reviewer.trim(), at:new Date().toLocaleString()}; return render(); }
-  if(t.id==='xolaFetch') return xolaFetch();
-  if(t.id==='xolaList') return xolaList();
 });
 document.addEventListener('input', e => {
   const t = e.target;

@@ -198,7 +198,7 @@ const Engine = (() => {
     { name: 'Chicago_River_Boat_Architecture_Tours', cls: 'Empire Tours:Chicago:Chicago Boats' }, { name: 'NYC_Discount_Tours', cls: 'NYC' },
     { name: 'NYC_Gangsters_and_Ghosts_Tours', cls: 'NYC:NYC G&G' }, { name: 'Tours_of_NYC', cls: 'NYC' }, { name: 'ToursOfNYC', cls: 'NYC' },
     { name: 'Amsterdam_Tours', cls: 'Empire Tours:Amsterdam' }, { name: 'Austin_Tours', cls: 'Empire Tours:Austin' }, { name: 'Charleston_Tour_Company', cls: 'Empire Tours:Charleston' },
-    { name: 'Italy_Tours', cls: 'Empire Tours:Milan' }, { name: 'Washington_DC_Sightseeing_Tours', cls: 'Empire Tours:Washington DC' }, { name: 'See_It_All_Chicago_Tours_LLC', cls: 'Empire Tours:SIA' },
+    { name: 'Italy_Tours', cls: 'Empire Tours:Milan' }, { name: 'Milan_Tours', cls: 'Empire Tours:Milan' }, { name: 'London_Sightseeing_Tours', cls: 'Empire Tours:London' }, { name: 'Washington_DC_Sightseeing_Tours', cls: 'Empire Tours:Washington DC' }, { name: 'See_It_All_Chicago_Tours_LLC', cls: 'Empire Tours:SIA' },
     { name: 'Ohio_Cabins', cls: '', personal: true }, { name: 'Wisconsin_Lodges', cls: '', personal: true }, { name: 'NOLA', cls: '', personal: true }, { name: 'Pownwall', cls: '', personal: true }
   ];
   const SUFFIX_RE = /(?:\s?[_\-]\s?(?:g|e|gbp|euro|eur|usd|v|cfl)|\s-\s(?:usd|gbp|eur))$/i;
@@ -472,6 +472,10 @@ const Engine = (() => {
           out.cls = opts[0].cls;
           out.reason = `${base} The amount matches the Xola payout of ${opts[0].locs.join(', ')}${opts[0].dates.length ? ' (paid ' + opts[0].dates.join(', ') + ')' : ''}, so the class is ${opts[0].cls} (SOP 13.6). Confirm to add it.`;
           trace.push('Platform payout: amount matched one Xola payout, class from the location table.');
+        } else if (opts.length === 1 && !opts[0].personal && !opts[0].cls) {
+          out.adminDefault = true;
+          out.reason = `${base} The amount matches the Xola payout of ${opts[0].locs.join(', ')}, but that location has no class in the SOP table. Administrative is pre-selected (SOP 4.1 Step 5); choose the right class and tell the Reviewer so the table can be completed.`;
+          trace.push('Platform payout: matched a location with no class in the table. Administrative by default.');
         } else if (opts.length === 1 && opts[0].personal) {
           out.reason = `${base} The amount matches a payout of ${opts[0].locs.join(', ')}, a personal property of Steven Garcia. It belongs in his personal book, not the Empire import (SOP 13.6).`;
           trace.push('Platform payout: matched a personal location (Steven).');

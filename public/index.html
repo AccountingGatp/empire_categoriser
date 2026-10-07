@@ -466,6 +466,7 @@ const Engine = (() => {
         const isXola = !ex && plat !== 'viator' && g !== 10032;
         out.lane = 'new'; out.payout = true; out.platform = ex ? ex.vendor : (plat === 'viator' || g === 10032) ? 'Viator' : 'Xola';
         out.gl = cc.error ? clr : cc.name; out.cls = ''; out.source = 'Platform payout rule (SOP 13.6)';
+        if (tx.suggestedGL && /sales clearing account/i.test(tx.suggestedGL)) { const sg = coaResolve(cfg.coa, tx.suggestedGL); if (!sg.error) out.gl = sg.name; else if (!(cfg.coa || []).length) out.gl = tx.suggestedGL.trim(); }
         const opts = isXola ? payoutOptions(tx, cfg) : [];
         out.payoutOptions = opts;
         const base = `${out.platform} payout, posts to ${out.gl}.`;
@@ -795,7 +796,7 @@ const Engine = (() => {
         const conf = isConfirmed(r), f = eff(r);
         return { id: r.id, date: r.date, dateRaw: r.dateRaw, desc: r.desc, vendor: f.vendor, gl: f.gl, cls: f.cls, amount: r.amount,
           account: r.account ? r.account.name : '', accNum: r.account ? r.account.num : '', accCard: !!(r.account && r.account.card), cur: r.account ? r.account.cur : '', topGl: conf ? 0 : (r.topGl || 0),
-          memo: conf ? (r.resolved.auto ? 'Xola payout matched by amount' : 'Confirmed' + (r.resolved.by ? ' by ' + r.resolved.by : '')) + (r.resolved.loc ? ' | Location: ' + r.resolved.loc.replace(/_/g, ' ') : '') : 'Auto: ' + r.source,
+          memo: conf ? (r.resolved.hist ? 'Same as earlier review' : r.resolved.auto ? 'Xola payout matched by amount' : 'Confirmed' + (r.resolved.by ? ' by ' + r.resolved.by : '')) + (r.resolved.loc ? ' | Location: ' + r.resolved.loc.replace(/_/g, ' ') : '') : 'Auto: ' + r.source,
           adminReview: conf ? isAdminClass(f.cls) : !!r.adminReview,
           newVendor: !!r.newVendor, limited: !!r.limited, steven: !!r.steven, lane: r.lane };
       });
@@ -963,7 +964,7 @@ const CHUNK = 40;
 function ensureIds(){ Object.keys(CL_LISTS).forEach(k => (S.cfg[k]||[]).forEach(r => { if(!r._id) r._id = rid(); })); S.mAdded.forEach(a => { if(!a._id) a._id = rid(); }); }
 const clDocs = () => {
   const o = {
-    'team/cfg': {classMap:S.cfg.classMap, classOverrides:S.cfg.classOverrides, usPayrollClasses:S.cfg.usPayrollClasses, billOnlyPatterns:S.cfg.billOnlyPatterns, stevenPost:S.cfg.stevenPost !== false},
+    'team/cfg': {classMap:S.cfg.classMap, classOverrides:S.cfg.classOverrides, usPayrollClasses:S.cfg.usPayrollClasses, billOnlyPatterns:S.cfg.billOnlyPatterns, stevenPost:S.cfg.stevenPost !== false, history:S.cfg.history || {}},
     'team/coa': {list:S.coa, source:S.coaSource},
     'team/classes': {list:S.classesUp, source:S.classSource}
   };
@@ -1174,8 +1175,26 @@ function process(){
   applyAuto();
 }
 /* A payout whose amount matches exactly one Xola payout (with a known class) needs no decision: it is confirmed automatically. */
+const NO_HIST = ['C2','C3','D','E','F'];
+function histKey(r){
+  const v = Engine.norm(r.payout ? (r.platform==='Xola' ? '' : r.platform) : (r.qboVendor || r.vendor || '')); if(!v || r.steven || NO_HIST.includes(r.tier)) return '';
+  return r.account.num + '|' + v + '|' + (r.amount < 0 ? 'out' : 'in');
+}
+function remember(r, res){
+  const k = histKey(r); if(!k || res.personal) return;
+  const H = S.cfg.history = S.cfg.history || {}, p = H[k];
+  H[k] = {vendor:res.vendor, gl:res.gl, cls:res.cls, at:today(), n:(p?p.n:0)+1};
+  const keys = Object.keys(H); if(keys.length > 400) keys.sort((a,b) => (H[a].at||'').localeCompare(H[b].at||'')).slice(0, keys.length-400).forEach(x => delete H[x]);
+  saveAll();
+}
 function applyAuto(){
   S.noAuto = S.noAuto || {};
+  const H = S.cfg.history || {};
+  S.results.forEach(r => {
+    if(r.resolved || S.noAuto[r.id] || r.autoConfirm || r.lane!=='new' || !Engine.canConfirm(r)) return;
+    const h = H[histKey(r)]; if(!h || !h.gl || !h.cls || Engine.isRetiredClass(h.cls) || Engine.isReserved(h.cls)) return;
+    r.resolved = {confirmed:true, auto:true, hist:true, vendor:h.vendor, gl:h.gl, cls:h.cls, isNewVendor:false};
+  });
   S.results.forEach(r => {
     if(!r.autoConfirm || r.resolved || S.noAuto[r.id]) return;
     const o = (r.payoutOptions||[])[0]; if(!o) return;
@@ -1283,10 +1302,10 @@ function vSop(){
   const st = (n, t, items) => `<div class="card"><h3 style="font-size:16px;margin-bottom:6px"><span class="chip l-old" style="margin-right:8px">Step ${n}</span>${t}</h3><ul class="sopl">${items.map(i => `<li>${i}</li>`).join('')}</ul></div>`;
   return `
   <div class="pagehead"><div><h2>How to use this tool</h2><p>It sorts the bank feed using the Empire categorisation SOP and builds the SaasAnt files. Follow the steps in order.</p></div><button class="btn primary" data-view="upload">Start</button></div>
-  ${st(0,'One-time setup (Data &amp; rules)',['Upload the <b>Vendor Master</b> once. Add the Chart of accounts and Classes if you have them. They are saved for the team.','Xola payouts load by themselves. Nothing to do.'])}
+  ${st(0,'One-time setup (Data &amp; rules)',['Upload the <b>Vendor Master</b> once. Add the Chart of accounts and Classes if you have them. They are saved for the team.','Xola payouts load by themselves. Nothing to do. <b>Remembered reviews</b> can be cleared here with Forget all.'])}
   ${st(1,'Upload',['Drop one bank CSV per account. Choose the account for each file.','Upload today\'s <b>open bills</b> (QuickBooks A/P Aging report), or press <b>None today</b>.','Press <b>Process</b>.'])}
   ${st(2,'Results',['See what the tool did with every row. Click a row to see why.','<b>Bill payments</b>: pay or match them in QuickBooks. They never go into the SaasAnt file.','<b>Ready for import</b>: matched by the rules, or already confirmed.','<b>Needs decision</b>: a person must decide. <b>Exception</b>: held for the Reviewer. <b>Out of scope</b>: payroll and transfers.'])}
-  ${st(3,'Resolve (team member)',['Open each card. Check the vendor, the account and the class. QBO\'s suggested account is already filled in.','Press <b>Confirm</b>. A new vendor is added to the Vendor Master automatically.','Xola payouts are matched to their location by amount and confirmed for you. Only unclear ones show here.','Held rows are for the Reviewer and Jonathan only.'])}
+  ${st(3,'Resolve (team member)',['Open each card. Check the vendor, the account and the class. QBO\'s suggested account is already filled in.','Press <b>Confirm</b>. A new vendor is added to the Vendor Master automatically.','Xola payouts are matched to their location by amount and confirmed for you. Only unclear ones show here.','<b>Remembered reviews:</b> once you confirm a row, the same payee on the same account is confirmed automatically next time. Press <b>Show</b> on the green line to see those rows, and <b>Undo</b> if one is wrong. Vendors that need a case-by-case answer (several GLs, payroll splits) are never remembered.','Held rows are for the Reviewer and Jonathan only.'])}
   ${st(4,'Review (reviewer)',['Read each check flag, tick it once you have judged it, enter your name and <b>Sign off</b>.','Sign-off needs every row decided and every flag ticked.'])}
   ${st(5,'Export',['Save the <b>SaasAnt Expense</b> and <b>Deposit</b> Excel files and import them in SaasAnt.','Save the lists you need: Bill payments, new vendors, Administrative class review, Steven personal.'])}
   ${st('+','Review File',['On the Upload page, <b>Review File</b> checks an older, hand-categorised file against the SOP. Nothing is posted or changed.'])}`;
@@ -1351,16 +1370,16 @@ function payoutBlock(r, d){
   return `<div class="picks"><span class="lbl">${o.length>1?'Same amount in several locations. Choose:':'Matching payout:'}</span>${chips}</div>`;
 }
 function draftFor(r){
-  if(!S.drafts[r.id]) S.drafts[r.id] = { vendor: r.qboVendor || r.vendor || r.platform || '', gl: r.gl || r.suggestedGL || '', loc: (r.payoutOptions&&r.payoutOptions.length===1) ? r.payoutOptions[0].locs.join(', ') : '', personal: !!(r.payoutOptions&&r.payoutOptions.length===1&&r.payoutOptions[0].personal), cls: (r.cls && !/^run class/i.test(r.cls)) ? r.cls : (r.adminDefault ? (S.cfg.classMap.Administrative || Engine.DEFAULT_CLASS_MAP.Administrative) : r.pickClass ? '' : r.proposedClass) };
+  if(!S.drafts[r.id]) S.drafts[r.id] = { vendor: r.qboVendor || r.vendor || r.platform || '', gl: r.suggestedGL || r.gl || '', loc: (r.payoutOptions&&r.payoutOptions.length===1) ? r.payoutOptions[0].locs.join(', ') : '', personal: !!(r.payoutOptions&&r.payoutOptions.length===1&&r.payoutOptions[0].personal), cls: (r.cls && !/^run class/i.test(r.cls)) ? r.cls : (r.adminDefault ? (S.cfg.classMap.Administrative || Engine.DEFAULT_CLASS_MAP.Administrative) : r.pickClass ? '' : r.proposedClass) };
   return S.drafts[r.id];
 }
 function vResolve(){
   if(!ready()) return noData('Resolve');
-  const autoN = S.results.filter(r => conf(r) && r.resolved.auto).length;
+  const autoN = S.results.filter(r => conf(r) && r.resolved.auto).length, histN = S.results.filter(r => conf(r) && r.resolved.hist).length, xN = autoN - histN;
   const list = S.results.filter(r => (r.lane==='new' || r.lane==='exception' || conf(r)) && !(conf(r) && r.resolved.auto && !S.showAuto));
   const actionable = list.filter(r => Engine.canConfirm(r) || conf(r));
   const done = actionable.filter(r => conf(r)).length;
-  if(!list.length) return `<div class="pagehead"><div><h2>Resolve</h2></div></div><div class="card empty"><b>Nothing is waiting for a decision.</b>Every row was matched with confidence, sent to the bill list, or is out of scope.${autoN?` ${autoN} Xola payout${autoN===1?'':'s'} matched by amount automatically.`:''}<br><br><button class="btn primary" data-view="review">Go to review</button></div>`;
+  if(!list.length) return `<div class="pagehead"><div><h2>Resolve</h2></div></div><div class="card empty"><b>Nothing is waiting for a decision.</b>Every row was matched with confidence, sent to the bill list, or is out of scope.${autoN?` ${autoN} row${autoN===1?'':'s'} confirmed automatically.`:''}<br><br><button class="btn primary" data-view="review">Go to review</button></div>`;
   const cards = list.map(r => {
     const ok = conf(r); const held = r.lane==='exception' && !Engine.canConfirm(r);
     const d = ok || held ? null : draftFor(r);
@@ -1382,7 +1401,7 @@ function vResolve(){
     }
     return `<div class="card rc ${ok?'done':''} ${r.newVendor&&!ok?'isnew':''}" data-card="${r.id}">${head}${r.payout&&!ok?'':`<div class="whybox">${esc(r.reason)}</div>`}${body}</div>`;
   }).join('');
-  const autoBar = autoN ? `<div class="banner"><span><b>${autoN} Xola payout${autoN===1?'':'s'}</b> matched by amount and confirmed automatically.</span><button class="btn small" data-toggle-auto="1">${S.showAuto?'Hide':'Show'}</button></div>` : '';
+  const autoBar = autoN ? `<div class="banner"><span><b>${autoN} row${autoN===1?'':'s'}</b> confirmed automatically${xN?`: ${xN} Xola payout${xN===1?'':'s'} matched by amount`:''}${xN&&histN?', ':''}${histN?`${xN?'':': '}${histN} same as an earlier review`:''}.</span><button class="btn small" data-toggle-auto="1">${S.showAuto?'Hide':'Show'}</button></div>` : '';
   return `
   <div class="pagehead"><div><h2>Resolve what the rules could not</h2><p>Identify the real vendor, choose the account and class from the full lists, then confirm. Nothing is guessed: rows you do not confirm stay out of the import.</p></div><div class="row"><progress max="${actionable.length||1}" value="${done}"></progress><span class="sub num">${done} of ${actionable.length} confirmed</span></div></div>
   ${autoBar}
@@ -1558,6 +1577,7 @@ function vData(){
     <div class="card dcard"><h3>Vendor Master</h3><p>${m?`${m} vendors${S.mMeta?' from '+esc(S.mMeta.file)+', loaded '+esc(S.mMeta.at):''}.`:'Not loaded. Upload the Empire Vendor Master workbook once. It is saved for the team when team storage is on, otherwise in this browser.'}</p>${m?`<div>${tierBreakdown()}</div>`:''}<div class="row">${up('upMaster', m?'Replace Vendor Master':'Upload Vendor Master', '.xlsx,.xls,.csv')}${m?'<button class="btn small" data-export="master">Save updated Excel</button>':''}</div></div>
     <div class="card dcard"><h3>Chart of accounts</h3><p>${S.coaSource==='upload'?`${S.coa.length} accounts from your upload. These fill every GL dropdown and are used to check accounts.`:`Using ${S.derived.gls.length} account names taken from the Vendor Master. Upload the full chart (QBO Account List, CSV or Excel) to get every account with its number.`}</p><div class="row">${up('upCoa', 'Upload chart of accounts', '.xlsx,.xls,.csv')}${S.coaSource==='upload'?'<button class="btn small ghost" data-clear="coa">Clear</button>':''}</div></div>
     <div class="card dcard"><h3>Classes</h3><p>${S.classSource==='upload'?`${S.classesUp.length} classes from your upload.`:`Using ${S.derived.classes.length} classes taken from the Vendor Master. Upload the full class list to get every class.`}</p><div class="row">${up('upClasses', 'Upload classes', '.xlsx,.xls,.csv')}${S.classSource==='upload'?'<button class="btn small ghost" data-clear="classes">Clear</button>':''}</div></div>
+    <div class="card dcard"><h3>Remembered reviews</h3><p>${Object.keys(S.cfg.history||{}).length} confirmed rows are remembered. The same payee on the same account is confirmed automatically next time, with Undo in Resolve.</p><div class="row"><button class="btn small ghost" data-clear="history" ${Object.keys(S.cfg.history||{}).length?'':'disabled'}>Forget all</button></div></div>
   </div>`;
   let body;
   const tab = S.dataTab;
@@ -1898,6 +1918,7 @@ function confirmRow(id){
   if(!r.payout && !r.steven && !S.mHeader.length && !S.master.some(m => Engine.norm(m.vendor)===Engine.norm(vend))) return toast('Load the Vendor Master first, so a new vendor can be added to it.');
   const isNew = !r.payout && !r.steven && !S.master.some(m => Engine.norm(m.vendor)===Engine.norm(vend));
   r.resolved = {confirmed:true, vendor:vend, gl:dr.gl.trim(), cls:dr.cls.trim(), by:S.member.trim()||'', isNewVendor:isNew, loc:r.payout?dr.loc:''};
+  remember(r, r.resolved);
   let extra = 0;
   if(isNew){
     const ix = Engine.masterIndex([S.mHeader]); const raw = new Array(S.mHeader.length).fill('');
@@ -1932,7 +1953,7 @@ document.addEventListener('click', async e => {
   if(d.feedDel){ S.feeds = S.feeds.filter(f => String(f.id)!==d.feedDel); return render(); }
   if(d.add){ S.cfg[S.dataTab].push(Object.assign({}, TABLES[S.dataTab].blank)); saveAll(); return render(); }
   if(d.del!==undefined){ S.cfg[S.dataTab].splice(+d.del, 1); saveAll(); rerun(); return render(); }
-  if(d.clear){ if(d.clear==='coa'){ S.coa = []; S.coaSource = ''; rerun(); } else { S.classesUp = []; S.classSource = ''; } saveAll(); return render(); }
+  if(d.clear){ if(d.clear==='history'){ S.cfg.history = {}; saveAll(); rerun(); return render(); } if(d.clear==='coa'){ S.coa = []; S.coaSource = ''; rerun(); } else { S.classesUp = []; S.classSource = ''; } saveAll(); return render(); }
   if(d.nobills){ S.cfg.noOpenBills = !S.cfg.noOpenBills; if(S.cfg.noOpenBills){ S.cfg.openBills = []; } saveAll(); rerun(); return render(); }
   if(d.undo){ const r = S.results.find(x => x.id===d.undo); r.resolved = null; (S.noAuto = S.noAuto||{})[r.id] = true; S.signed = null; return render(); }
   if(d.pickOpt){ const r = S.results.find(x=>x.id===d.pickOpt), x = r.payoutOptions[+d.i], dr = S.drafts[r.id]; dr.personal = !!x.personal; dr.cls = x.personal ? '' : x.cls; dr.loc = x.locs.join(', '); return render(); }

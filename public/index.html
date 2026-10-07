@@ -1293,7 +1293,7 @@ function vUpload(){
   </div>
   <div class="card" style="display:flex;flex-direction:column;gap:4px">
     <div class="rd"><span class="dot ${br&&fresh||S.cfg.noOpenBills?'ok':'warn'}"></span><span><b>Open bills</b><div class="sub">${billsTxt}</div></span><span class="row">${up('upBills', br?'Replace':'Upload', '.xlsx,.xls,.csv')}<button class="btn small ghost" data-nobills="1">${S.cfg.noOpenBills?'Undo':'None today'}</button></span></div>
-    <div class="rd"><span class="dot ${(S.xola||{}).st==='ok'?'ok':(S.xola||{}).st==='err'?'bad':'warn'}"></span><span><b>Xola payouts</b><div>${xolaStatus()}</div></span>${up('upXola', 'Upload report', '.xlsx,.xls,.csv', true)}</div>
+    <div class="rd"><span class="dot ${(S.xola||{}).st==='ok'?'ok':(S.xola||{}).st==='err'?'bad':'warn'}"></span><span><b>Xola payouts</b><div>${xolaStatus()}</div></span><button class="btn small" data-goto-data="xola" title="Edit Xola payouts" aria-label="Edit Xola payouts"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></button></div>
   </div>
   <div class="row"><button class="btn primary" id="processBtn" ${can?'':'disabled'}>Process ${S.feeds.length||''} file${S.feeds.length===1?'':'s'}</button>${S.feeds.length && !can?'<span class="sub">Choose an account for every file.</span>':''}</div>`;
 }
@@ -1603,7 +1603,7 @@ function vData(){
     const wide = k => tab==='openBills' && k==='bucket' ? ' style="min-width:360px"' : tab==='openBills' && k==='vendor' ? ' style="min-width:200px"' : '';
     const rws = list.map((row, i) => `<tr>${cols.map(([k,,ty]) => `<td><input${wide(k)} type="${ty||'text'}" ${ty==='number'?'step="0.01"':''} data-r="${i}" data-k="${k}" value="${esc(ty==='date' ? normDate(row[k]) : row[k])}"></td>`).join('')}<td><button class="btn small ghost" data-del="${i}">Remove</button></td></tr>`).join('');
     const withRules = tab==='emailRules' || tab==='bankRules';
-    const buttons = `<div class="row"><button class="btn" data-add="1">Add row</button>${tab==='emailRules'||tab==='bankRules'||tab==='payrollMap'?up('imp-'+tab,'Import CSV / Excel','.xlsx,.xls,.csv'):''}</div>`;
+    const buttons = `<div class="row"><button class="btn" data-add="1">Add row</button>${tab==='emailRules'||tab==='bankRules'||tab==='payrollMap'?up('imp-'+tab,'Import CSV / Excel','.xlsx,.xls,.csv'):''}${tab==='payoutIndex'?'<span class="filebtn btn">Upload Payouts Report<input type="file" id="upXola" accept=".xlsx,.xls,.csv" multiple></span>':''}</div>`;
     const billSum = tab==='openBills' && list.length ? `<div class="banner"><span><b>${new Set(list.map(b=>b.vendor)).size} vendors</b> have open balances, ${list.filter(b=>!b.total).length} balance line${list.filter(b=>!b.total).length===1?'':'s'}, loaded ${esc(S.cfg.billsAt||'')}. ${list.some(b=>b.date)?'':'This is the Aging Summary, so there are no bill dates. Upload the A/P Aging Detail to get dates and bill numbers.'}</span></div>` : '';
     const unk = tab==='payoutIndex' ? [...new Set(list.map(x=>x.loc).filter(l=>l && !Engine.findLoc(l, S.cfg)))] : [];
     const payoutSum = tab==='payoutIndex' && unk.length ? `<div class="banner warn"><span><b>Location not in the SOP table:</b> ${unk.map(esc).join(', ')}. Rename it to a name from SOP 13.6 (for example Chicago_Discount_Tours), or it cannot give a class.</span></div>` : '';
@@ -1943,7 +1943,7 @@ document.addEventListener('click', async e => {
   if(!t) return;
   const d = t.dataset;
   if(d.view) return go(d.view);
-  if(d.gotoData){ if(d.gotoData==='bills') return go('upload'); S.dataTab = 'master'; return go('data'); }
+  if(d.gotoData){ if(d.gotoData==='bills') return go('upload'); if(d.gotoData==='xola'){ S.dataTab = 'payoutIndex'; return go('data'); } S.dataTab = 'master'; return go('data'); }
   if(d.filter){ S.filter = S.filter===d.filter && d.filter!=='all' ? 'all' : d.filter; return render(); }
   if(d.open){ S.open[d.open] = !S.open[d.open]; return render(); }
   if(d.saveList) return doExport(d.saveList);

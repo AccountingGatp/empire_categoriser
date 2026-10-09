@@ -199,7 +199,7 @@ const Engine = (() => {
     { name: 'Chicago_River_Boat_Architecture_Tours', cls: 'Empire Tours:Chicago:Chicago Boats' }, { name: 'NYC_Discount_Tours', cls: 'NYC' },
     { name: 'NYC_Gangsters_and_Ghosts_Tours', cls: 'NYC:NYC G&G' }, { name: 'Tours_of_NYC', cls: 'NYC' }, { name: 'ToursOfNYC', cls: 'NYC' },
     { name: 'Amsterdam_Tours', cls: 'Empire Tours:Amsterdam' }, { name: 'Austin_Tours', cls: 'Empire Tours:Austin' }, { name: 'Charleston_Tour_Company', cls: 'Empire Tours:Charleston' },
-    { name: 'Italy_Tours', cls: 'Empire Tours:Milan' }, { name: 'Milan_Tours', cls: 'Empire Tours:Milan' }, { name: 'London_Sightseeing_Tours', cls: 'Empire Tours:London' }, { name: 'Washington_DC_Sightseeing_Tours', cls: 'Empire Tours:Washington DC' }, { name: 'See_It_All_Chicago_Tours_LLC', cls: 'Empire Tours:SIA' },
+    { name: 'Italy_Tours', cls: 'Empire Tours:Milan' }, { name: 'Milan_Tours', cls: 'Empire Tours:Milan' }, { name: 'London_Sightseeing_Tours', cls: 'Empire Tours:London' }, { name: 'Washington_DC_Sightseeing_Tours', cls: 'Empire Tours:Washington DC' }, { name: 'Washington_DC_Tours', cls: 'Empire Tours:Washington DC' }, { name: 'See_It_All_Chicago_Tours_LLC', cls: 'Empire Tours:SIA' },
     { name: 'Ohio_Cabins', cls: '', personal: true }, { name: 'Wisconsin_Lodges', cls: '', personal: true }, { name: 'NOLA', cls: '', personal: true }, { name: 'Pownwall', cls: '', personal: true }
   ];
   const SUFFIX_RE = /(?:\s?[_\-]\s?(?:g|e|gbp|euro|eur|usd|v|cfl)|\s-\s(?:usd|gbp|eur))$/i;
@@ -287,10 +287,10 @@ const Engine = (() => {
   /* Platforms that pay Empire out: the deposit is cleared through Sales Clearing, never booked as sales. */
   const PLATFORMS = [
     { key: 'getyourguide', name: 'Get Your Guide', gl: '10032.3 Sales Clearing Account:GYG Sales' },
-    { key: 'groupon', name: 'Groupon', gl: '10032.2 Sales Clearing Account:Groupon Sales' },
+    { key: 'groupon', alt: 'grpn', name: 'Groupon', gl: '10032.2 Sales Clearing Account:Groupon Sales' },
     { key: 'airbnb', name: 'Airbnb', gl: '10032.1 Sales Clearing Account:Airbnb Sales' }
   ];
-  const builtinPlatform = (tx, descL) => { const c = (descL + ' ' + tx.vendor).toLowerCase().replace(/[^a-z0-9]/g, ''); const p = PLATFORMS.find(x => c.includes(x.key)); return p ? { vendor: p.name, gl: p.gl } : null; };
+  const builtinPlatform = (tx, descL) => { const c = (descL + ' ' + tx.vendor).toLowerCase().replace(/[^a-z0-9]/g, ''); const p = PLATFORMS.find(x => c.includes(x.key) || (x.alt && c.includes(x.alt))); return p ? { vendor: p.name, gl: p.gl } : null; };
 
   function loadFeed(csvText, account, prefix, forced) {
     const recs = csvToObjects(csvText);
@@ -502,6 +502,15 @@ const Engine = (() => {
         out.gl = cc.error ? clr : cc.name; out.cls = ''; out.source = 'Platform payout rule (SOP 13.6)';
         if (tx.suggestedGL && /sales clearing account/i.test(tx.suggestedGL)) { const sg = coaResolve(cfg.coa, tx.suggestedGL); if (!sg.error) out.gl = sg.name; else if (!(cfg.coa || []).length) out.gl = tx.suggestedGL.trim(); }
         const opts = isXola ? payoutOptions(tx, cfg) : [];
+        /* Groupon names the location in the ACH text: "IND NAME:Charleston Tour Compan" */
+        let indCls = '', indName = '';
+        if (!isXola && out.platform === 'Groupon') {
+          const mi = tx.desc.match(/IND\s*N\s*A\s*M\s*E:\s*(.+?)\s+TRN/i);
+          if (mi) {
+            indName = mi[1].replace(/\s+/g, ' ').trim(); const q = normLoc(indName);
+            if (q.length >= 8) { const hit = (cfg.payoutLocations || DEFAULT_PAYOUT_LOCATIONS).filter(l => !l.personal && l.cls && normLoc(l.name).startsWith(q)); if (hit.length && new Set(hit.map(l => l.cls)).size === 1) indCls = hit[0].cls; }
+          }
+        }
         out.payoutOptions = opts;
         const base = `${out.platform} payout, posts to ${out.gl}.`;
         if (opts.length === 1 && !opts[0].personal && opts[0].cls) {
@@ -520,6 +529,10 @@ const Engine = (() => {
           out.pickClass = true;
           out.reason = `${base} Same amount in several locations (${opts.map(o => o.locs.join(', ').replace(/_/g, ' ')).join(' / ')}). Choose one.`;
           trace.push('Platform payout: same amount in several locations. A person chooses the class.');
+        } else if (indCls) {
+          out.cls = indCls;
+          out.reason = `${base} Class ${indCls} from the location named in the bank text (${indName}).`;
+          trace.push('Groupon payout: class taken from the location named in the bank text.');
         } else {
           out.adminDefault = true;
           out.reason = `${base} ${isXola ? ((cfg.payoutIndex || []).length ? 'No Xola payout of this amount found' : 'No Xola payouts loaded') : 'Not a Xola payout'}. Administrative selected.`;
@@ -831,7 +844,7 @@ const Engine = (() => {
         const conf = isConfirmed(r), f = eff(r);
         return { id: r.id, date: r.date, dateRaw: r.dateRaw, desc: r.desc, vendor: f.vendor, gl: f.gl, cls: f.cls, amount: r.amount,
           account: r.account ? r.account.name : '', accNum: r.account ? r.account.num : '', accCard: !!(r.account && r.account.card), cur: r.account ? r.account.cur : '', topGl: conf ? 0 : (r.topGl || 0),
-          memo: conf ? (r.resolved.hist ? 'Same as earlier review' : r.resolved.auto ? 'Xola payout matched by amount' : 'Confirmed' + (r.resolved.by ? ' by ' + r.resolved.by : '')) + (r.resolved.loc ? ' | Location: ' + r.resolved.loc.replace(/_/g, ' ') : '') : 'Auto: ' + r.source,
+          memo: conf ? (r.resolved.hist ? 'Same as earlier review' : r.resolved.plat ? 'Platform payout, Sales Clearing' : r.resolved.auto ? 'Xola payout matched by amount' : 'Confirmed' + (r.resolved.by ? ' by ' + r.resolved.by : '')) + (r.resolved.loc ? ' | Location: ' + r.resolved.loc.replace(/_/g, ' ') : '') : 'Auto: ' + r.source,
           adminReview: conf ? isAdminClass(f.cls) : !!r.adminReview,
           newVendor: !!r.newVendor, limited: !!r.limited, steven: !!r.steven, lane: r.lane };
       });
@@ -1212,7 +1225,7 @@ function process(){
 /* A payout whose amount matches exactly one Xola payout (with a known class) needs no decision: it is confirmed automatically. */
 const NO_HIST = ['C2','C3','D','E','F'];
 function histKey(r){
-  const v = Engine.norm(r.payout ? (r.platform==='Xola' ? '' : r.platform) : (r.qboVendor || r.vendor || '')); if(r.steven || NO_HIST.includes(r.tier)) return '';
+  const v = Engine.norm(r.payout ? ((r.platform==='Xola' || r.platform==='Groupon') ? '' : r.platform) : (r.qboVendor || r.vendor || '')); if(r.steven || NO_HIST.includes(r.tier)) return '';
   if(!v){ if(r.exKind!=='novendor' || !r.desc) return ''; return r.account.num + '|~' + Engine.norm(r.desc).slice(0,60) + '|' + r.amount.toFixed(2); }   // payee not in the bank text: same text + same amount
   return r.account.num + '|' + v + '|' + (r.amount < 0 ? 'out' : 'in');
 }
@@ -1229,6 +1242,11 @@ function applyToBill(){
 function applyAuto(){
   S.noAuto = S.noAuto || {};
   const H = S.cfg.history || {};
+  /* A deposit from a known platform (GetYourGuide, Airbnb, Groupon, Viator...) is fully decided: Sales Clearing account, class per SOP. Nothing for a person to resolve. */
+  S.results.forEach(r => {
+    if(r.resolved || S.noAuto[r.id] || r.lane!=='new' || !r.payout || r.platform==='Xola' || r.pickClass || r.autoConfirm || !r.gl) return;
+    r.resolved = {confirmed:true, auto:true, plat:true, vendor:r.platform, gl:r.gl, cls:r.cls || (S.cfg.classMap.Administrative || Engine.DEFAULT_CLASS_MAP.Administrative), isNewVendor:false};
+  });
   S.results.forEach(r => {
     if(r.resolved || S.noAuto[r.id] || r.autoConfirm || !(r.lane==='new' || r.exKind==='novendor') || !Engine.canConfirm(r)) return;
     const h = H[histKey(r)]; if(!h || !h.gl || !h.cls || Engine.isRetiredClass(h.cls) || Engine.isReserved(h.cls)) return;
@@ -1344,7 +1362,7 @@ function vSop(){
   ${st(0,'One-time setup (Data &amp; rules)',['Upload the <b>Vendor Master</b> once. Add the Chart of accounts and Classes if you have them. They are saved for the team.','Xola payouts load by themselves. Nothing to do. <b>Remembered reviews</b> can be cleared here with Forget all.'])}
   ${st(1,'Upload',['Drop one bank CSV per account. Choose the account for each file.','Upload today\'s <b>open bills</b> (QuickBooks A/P Aging report), or press <b>None today</b>.','Press <b>Process</b>.'])}
   ${st(2,'Results',['See what the tool did with every row. Click a row to see why.','<b>Bill payments</b>: pay or match them in QuickBooks. They never go into the SaasAnt file.','<b>Ready for import</b>: matched by the rules, or already confirmed.','<b>Needs decision</b>: a person must decide. <b>Exception</b>: held for the Reviewer. <b>Out of scope</b>: payroll and transfers.'])}
-  ${st(3,'Resolve (team member)',['Open each card. Check the vendor, the account and the class. QBO\'s suggested account is already filled in.','Press <b>Confirm</b>. A new vendor is added to the Vendor Master automatically.','Xola payouts are matched to their location by amount and confirmed for you. Only unclear ones show here.','<b>Remembered reviews:</b> once you confirm a row, the same payee on the same account is confirmed automatically next time. Press <b>Show</b> on the green line to see those rows, and <b>Undo</b> if one is wrong. Vendors that need a case-by-case answer (several GLs, payroll splits) are never remembered.','Held rows are for the Reviewer and Jonathan only.'])}
+  ${st(3,'Resolve (team member)',['Open each card. Check the vendor, the account and the class. QBO\'s suggested account is already filled in.','Press <b>Confirm</b>. A new vendor is added to the Vendor Master automatically.','Rows that are fully decided are confirmed for you and do not appear here: Xola payouts matched by amount, deposits from GetYourGuide, Airbnb, Groupon and Viator, and repeats of an earlier review. Only unresolved rows are shown, with a line saying why.','<b>Remembered reviews:</b> once you confirm a row, the same payee on the same account is confirmed automatically next time. Press <b>Show</b> on the green line to see those rows, and <b>Undo</b> if one is wrong. Vendors that need a case-by-case answer (several GLs, payroll splits) are never remembered.','Held rows are for the Reviewer and Jonathan only.'])}
   ${st(4,'Review (reviewer)',['Read each check flag, tick it once you have judged it, enter your name and <b>Sign off</b>.','Sign-off needs every row decided and every flag ticked.'])}
   ${st(5,'Export',['Save the <b>SaasAnt Expense</b> and <b>Deposit</b> Excel files and import them in SaasAnt.','Save the lists you need: Bill payments, new vendors, Administrative class review, Steven personal.'])}
   ${st('+','Review File',['On the Upload page, <b>Review File</b> checks an older, hand-categorised file against the SOP. Nothing is posted or changed.'])}`;
@@ -1412,9 +1430,19 @@ function draftFor(r){
   if(!S.drafts[r.id]) S.drafts[r.id] = { vendor: (r.payout && r.platform) ? r.platform : (r.qboVendor || r.vendor || r.platform || ''), gl: r.gl || r.suggestedGL || '', loc: (r.payoutOptions&&r.payoutOptions.length===1) ? r.payoutOptions[0].locs.join(', ') : '', personal: !!(r.payoutOptions&&r.payoutOptions.length===1&&r.payoutOptions[0].personal), cls: (r.cls && !/^run class/i.test(r.cls)) ? r.cls : (r.adminDefault ? (S.cfg.classMap.Administrative || Engine.DEFAULT_CLASS_MAP.Administrative) : r.pickClass ? '' : r.proposedClass) };
   return S.drafts[r.id];
 }
+function whyShort(r){
+  if(r.exKind==='novendor') return 'No payee in the bank text';
+  if(r.payout && r.pickClass) return 'Same Xola amount in several locations';
+  if(r.payout && r.platform==='Xola') return (r.payoutOptions||[]).length ? 'Xola location has no class in the SOP table' : 'Xola payout not found in the payout list';
+  if(r.payout) return 'Payout needs a decision';
+  if(r.tier==='C2'||r.tier==='C3'||r.tier==='D'||r.tier==='F'||r.tier==='E') return 'Vendor needs a case-by-case answer (tier '+r.tier+')';
+  if(r.newVendor) return 'New vendor, not in the Vendor Master';
+  if(r.adminDefault) return 'Class could not be decided';
+  return 'Needs a decision';
+}
 function vResolve(){
   if(!ready()) return noData('Resolve');
-  const autoN = S.results.filter(r => conf(r) && r.resolved.auto).length, histN = S.results.filter(r => conf(r) && r.resolved.hist).length, xN = autoN - histN;
+  const autoN = S.results.filter(r => conf(r) && r.resolved.auto).length, histN = S.results.filter(r => conf(r) && r.resolved.hist).length, platN = S.results.filter(r => conf(r) && r.resolved.plat).length, xN = autoN - histN - platN;
   const list = S.results.filter(r => (r.lane==='new' || r.lane==='exception' || conf(r)) && !(conf(r) && r.resolved.auto && !S.showAuto));
   const actionable = list.filter(r => Engine.canConfirm(r) || conf(r));
   const done = actionable.filter(r => conf(r)).length;
@@ -1439,12 +1467,13 @@ function vResolve(){
       ${gls?`<div class="picks"><span class="lbl">${r.suggestGls&&r.suggestGls.length?'Accounts this vendor has used:':'QBO suggested:'}</span>${gls}</div>`:''}
       <div class="row" style="justify-content:flex-end">${r.amount<0&&!r.payout?`<button class="btn ghost" data-to-bill="${r.id}">Pay a bill instead</button>`:''}<button class="btn primary" data-confirm="${r.id}">Confirm</button></div>`;
     }
-    return `<div class="card rc ${ok?'done':''} ${r.newVendor&&!ok?'isnew':''}" data-card="${r.id}">${head}${r.payout&&!ok?'':`<div class="whybox">${esc(r.reason)}</div>`}${body}</div>`;
+    return `<div class="card rc ${ok?'done':''} ${r.newVendor&&!ok?'isnew':''}" data-card="${r.id}">${head}${ok?'':`<div class="whybox">${esc(r.reason)}</div>`}${body}</div>`;
   }).join('');
-  const autoBar = autoN ? `<div class="banner"><span><b>${autoN} row${autoN===1?'':'s'}</b> confirmed automatically${xN?`: ${xN} Xola payout${xN===1?'':'s'} matched by amount`:''}${xN&&histN?', ':''}${histN?`${xN?'':': '}${histN} same as an earlier review`:''}.</span><button class="btn small" data-toggle-auto="1">${S.showAuto?'Hide':'Show'}</button></div>` : '';
+  const autoBar = autoN ? `<div class="banner"><span><b>${autoN} row${autoN===1?'':'s'}</b> confirmed automatically: ${[xN?`${xN} Xola payout${xN===1?'':'s'} matched by amount`:'', platN?`${platN} platform deposit${platN===1?'':'s'} (GetYourGuide, Airbnb, Groupon...)`:'', histN?`${histN} same as an earlier review`:''].filter(Boolean).join(', ')}.</span><button class="btn small" data-toggle-auto="1">${S.showAuto?'Hide':'Show'}</button></div>` : '';
   return `
   <div class="pagehead"><div><h2>Resolve what the rules could not</h2><p>Identify the real vendor, choose the account and class from the full lists, then confirm. Nothing is guessed: rows you do not confirm stay out of the import.</p></div><div class="row"><progress max="${actionable.length||1}" value="${done}"></progress><span class="sub num">${done} of ${actionable.length} confirmed</span></div></div>
   ${autoBar}
+  ${(()=>{ const c={}; list.filter(r=>!conf(r)&&r.lane!=='bill').forEach(r=>{ const k=whyShort(r); c[k]=(c[k]||0)+1; }); const e=Object.entries(c); return e.length?`<div class="banner warn"><span><b>Why these rows are here:</b> ${e.map(([k,n])=>esc(k)+' ('+n+')').join(' · ')}</span></div>`:''; })()}
   <div class="rcards">${cards}</div>
   <datalist id="vlist">${S.master.map(m=>`<option value="${esc(m.vendor)}">`).join('')}</datalist>
   ${actionable.length && done===actionable.length?`<div class="row"><button class="btn primary" data-view="review">Continue to review</button></div>`:''}`;

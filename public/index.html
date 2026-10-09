@@ -261,13 +261,36 @@ const Engine = (() => {
   }
 
   /* ---------- bank feed ---------- */
+  /* A bank is never the payee: "VIA: CITIZENS BANK" in a wire only names the route. */
+  const BANK_RE = /^(citizens bank|wells fargo( bank)?|jpmorgan chase( bank)?|jp morgan chase( bank)?|chase( bank)?|bank of america|standard chartered bank|citibank|td bank|pnc bank|u\.?s\.? bank|truist( bank)?|santander( bank)?|hsbc( bank)?|barclays( bank)?|lloyds( bank)?)( n\.?a\.?)?$/i;
+  const isBankName = v => BANK_RE.test(String(v || '').replace(/\s+/g, ' ').trim());
   function extractVendor(desc, payee) {
-    if (payee && payee.trim()) return payee.replace(/\s+/g, ' ').trim();
-    let d = String(desc || '');
+    if (payee && payee.trim() && !isBankName(payee)) return payee.replace(/\s+/g, ' ').trim();
+    let d = String(desc || '').replace(/\s+/g, ' ').trim();
+    /* Chase ACH: ORIG CO NAME:<company> ORIG ID:... */
+    const ach = d.match(/ORIG CO NAME:\s*(.+?)\s+(?:ORIG ID:|CO ENTRY DESCR:|DESC DATE:|SEC:|TRACE#)/i);
+    if (ach && ach[1].trim()) return ach[1].trim();
+    /* Wire: ... VIA: <bank> ... A/C: <beneficiary> <city> <state> X1234 US REF: ... */
+    const wire = d.match(/\bA\/C:\s*(.+?)(?:\s+REF:|\s+X\d{3,}|\s+IMAD|\s+US\b|$)/i);
+    if (wire && /wire/i.test(d)) { const w = wire[1].replace(/\s+[A-Z]{2}$/, '').trim(); if (w && !isBankName(w)) return w; }
     d = d.replace(/^(sent money to|sent money|received money from|received money|paid to|card transaction of [\d.]+ [a-z]+ (issued )?by)\s*/i, '');
     d = d.replace(/\s*ref:.*$/i, '').replace(/^(miss|mr|mrs|ms)\s+/i, '');
-    return d.replace(/\s+/g, ' ').trim();
+    d = d.replace(/\s+/g, ' ').trim();
+    return isBankName(d) ? '' : d;
   }
+  /* A wire's beneficiary text carries the city after the name: find the Vendor Master name it starts with. */
+  function prefixVendor(text, master) {
+    const t = norm(text); let best = null;
+    (master || []).forEach(m => { const k = norm(m.vendor); if (k.length >= 4 && (t === k || t.startsWith(k + ' ')) && (!best || k.length > best.k.length)) best = { k, vendor: m.vendor }; });
+    return best ? best.vendor : '';
+  }
+  /* Platforms that pay Empire out: the deposit is cleared through Sales Clearing, never booked as sales. */
+  const PLATFORMS = [
+    { key: 'getyourguide', name: 'Get Your Guide', gl: '10032.3 Sales Clearing Account:GYG Sales' },
+    { key: 'groupon', name: 'Groupon', gl: '10032.2 Sales Clearing Account:Groupon Sales' },
+    { key: 'airbnb', name: 'Airbnb', gl: '10032.1 Sales Clearing Account:Airbnb Sales' }
+  ];
+  const builtinPlatform = (tx, descL) => { const c = (descL + ' ' + tx.vendor).toLowerCase().replace(/[^a-z0-9]/g, ''); const p = PLATFORMS.find(x => c.includes(x.key)); return p ? { vendor: p.name, gl: p.gl } : null; };
 
   function loadFeed(csvText, account, prefix, forced) {
     const recs = csvToObjects(csvText);
@@ -277,7 +300,10 @@ const Engine = (() => {
       let spent = money(pick(r, 'spent', 'payment', 'debit', 'withdrawal')), rec = money(pick(r, 'received', 'deposit', 'credit'));
       const amt = pick(r, 'amount');
       if (!spent && !rec && amt) { const a = money(amt); if (a < 0) spent = -a; else rec = a; }
-      const desc = pick(r, 'description', 'memo', 'name');
+      let desc = pick(r, 'description', 'memo', 'name');
+      /* some exports keep the full bank text in a second column; use it so the real payee can be read */
+      const more = pick(r, 'bank detail', 'bank details', 'bank description', 'original description', 'full description', 'details', 'memo');
+      if (more && !desc.toLowerCase().includes(more.toLowerCase())) desc = (desc ? desc + ' ' : '') + more;
       const payee = pick(r, 'payee', 'vendor');
       const dateRaw = pick(r, 'date');
       const id = prefix + '-t' + i;
@@ -439,6 +465,12 @@ const Engine = (() => {
     const acct = tx.account || {};
     const out = { lane: 'new', gl: '', cls: '', source: '', tier: '', qboVendor: '', topGl: 0, newVendor: false, adminReview: false, limited: false, reason: '', trace, exKind: '', billStatus: '', sub: '', suggestGls: [], suggest: [], hint: '' };
     const descL = tx.desc.toLowerCase();
+    if (/wire/i.test(tx.desc) && /A\/C:/i.test(tx.desc) && tx.vendor && !(resolveVendor(tx.vendor, (tx.account || {}).cur, ix).rec)) { const pv = prefixVendor(tx.vendor, cfg.master); if (pv) tx = Object.assign({}, tx, { vendor: pv }); }
+    /* Payee unreadable (only a bank named): an unpaid bill of exactly this amount, for one vendor, tells who was paid. */
+    if (!tx.vendor && tx.amount < 0) {
+      const hits = (cfg.openBills || []).filter(b => !b.total && b.amount > 0 && Math.abs(b.amount - Math.abs(tx.amount)) < 0.005);
+      if (hits.length && new Set(hits.map(b => baseKey(b.vendor))).size === 1) { tx = Object.assign({}, tx, { vendor: hits[0].vendor, inferred: true }); trace.push('The bank text did not name the payee. One open bill has exactly this amount, so its vendor is used: ' + hits[0].vendor + '.'); }
+    }
     const vkey = baseKey(tx.vendor);
     const bankClass = acct.bankClass ? mapClass(acct.bankClass, cfg) : '';
 
@@ -449,7 +481,7 @@ const Engine = (() => {
       const kw = SCOPE_KEYWORDS.find(k => (hasWord(descL, k) || hasWord(vkey, k)) && !(k === 'transfer' && /\bwire\b/.test(descL)));
       const conv = /(convert|conversion|exchange)/i.test(tx.desc);
       const plat = hasWord(descL, 'xola') || hasWord(vkey, 'xola') ? 'xola' : (hasWord(descL, 'viator') || hasWord(vkey, 'viator')) ? 'viator' : '';
-      const ex = tx.amount > 0 && (cfg.excluded || []).find(e => baseKey(e.vendor) === vkey && /sales clearing/i.test(e.gl || ''));
+      const ex = tx.amount > 0 && ((cfg.excluded || []).find(e => baseKey(e.vendor) === vkey && /sales clearing/i.test(e.gl || '')) || builtinPlatform(tx, descL));
       if (conv) {
         const cur = [...new Set((tx.desc.match(/\b(USD|GBP|EUR)\b/g) || []))];
         out.lane = 'scope'; out.sub = 'conversion';
@@ -525,6 +557,7 @@ const Engine = (() => {
       if (hit) {
         out.lane = 'bill'; out.billStatus = 'match';
         out.reason = `Matches ${hit.total ? 'the total open balance' : 'an open bill'} of ${hit.amount.toFixed(2)}${hit.bucket ? ' (A/P aging: ' + hit.bucket + ')' : hit.date ? ' dated ' + hit.date : ''}${hit.no ? ' (bill ' + hit.no + ')' : ''}. Confirm with Pay Bills / Match in QBO.`;
+        if (tx.inferred) out.reason += ' The bank text only named a bank, so the vendor was taken from this open bill. Check it before matching.';
         trace.push('Step 2: open bill found for this vendor and amount. Routed to the Bill Payments List, not categorised.');
         return out;
       }
@@ -545,7 +578,7 @@ const Engine = (() => {
 
     if (!tx.vendor) {
       out.lane = 'exception'; out.exKind = 'novendor';
-      out.reason = 'No vendor could be identified. Held in the Exception Queue, never posted under a placeholder.';
+      out.reason = /\bvia:/i.test(tx.desc) || isBankName(tx.desc) || isBankName(tx.payee) ? 'The bank text only names the bank, not the payee. Open the transaction in QBO, read the Bank detail, and type the vendor.' : 'No vendor could be identified. Held in the Exception Queue, never posted under a placeholder.';
       trace.push('No vendor identifiable (SOP 6.1).');
       return out;
     }
@@ -1370,7 +1403,7 @@ function payoutBlock(r, d){
   return `<div class="picks"><span class="lbl">${o.length>1?'Same amount in several locations. Choose:':'Matching payout:'}</span>${chips}</div>`;
 }
 function draftFor(r){
-  if(!S.drafts[r.id]) S.drafts[r.id] = { vendor: r.qboVendor || r.vendor || r.platform || '', gl: r.suggestedGL || r.gl || '', loc: (r.payoutOptions&&r.payoutOptions.length===1) ? r.payoutOptions[0].locs.join(', ') : '', personal: !!(r.payoutOptions&&r.payoutOptions.length===1&&r.payoutOptions[0].personal), cls: (r.cls && !/^run class/i.test(r.cls)) ? r.cls : (r.adminDefault ? (S.cfg.classMap.Administrative || Engine.DEFAULT_CLASS_MAP.Administrative) : r.pickClass ? '' : r.proposedClass) };
+  if(!S.drafts[r.id]) S.drafts[r.id] = { vendor: r.qboVendor || r.vendor || r.platform || '', gl: r.gl || r.suggestedGL || '', loc: (r.payoutOptions&&r.payoutOptions.length===1) ? r.payoutOptions[0].locs.join(', ') : '', personal: !!(r.payoutOptions&&r.payoutOptions.length===1&&r.payoutOptions[0].personal), cls: (r.cls && !/^run class/i.test(r.cls)) ? r.cls : (r.adminDefault ? (S.cfg.classMap.Administrative || Engine.DEFAULT_CLASS_MAP.Administrative) : r.pickClass ? '' : r.proposedClass) };
   return S.drafts[r.id];
 }
 function vResolve(){

@@ -304,6 +304,8 @@ const Engine = (() => {
       /* some exports keep the full bank text in a second column; use it so the real payee can be read */
       const more = pick(r, 'bank detail', 'bank details', 'bank description', 'original description', 'full description', 'details', 'memo');
       if (more && !desc.toLowerCase().includes(more.toLowerCase())) desc = (desc ? desc + ' ' : '') + more;
+      /* any other column that carries a wire / ACH text (whatever the export calls it) */
+      Object.keys(r).forEach(k => { const v = String(r[k] || ''); if (v.length > 25 && /A\/C:|ORIG CO NAME:/i.test(v) && !desc.toLowerCase().includes(v.toLowerCase().slice(0, 40))) desc = (desc ? desc + ' ' : '') + v; });
       const payee = pick(r, 'payee', 'vendor');
       const dateRaw = pick(r, 'date');
       const id = prefix + '-t' + i;
@@ -1204,13 +1206,14 @@ function process(){
   S.txs = [];
   S.feeds.forEach((f, i) => { if(f.acctIdx >= 0){ const t = Engine.loadFeed(f.text, acctFor(f), 'f'+f.id, S.forced); f.count = t.length; S.txs.push(...t); } });
   S.results = Engine.run(S.txs, cfgAll());
-  S.drafts = {}; S.acks = {}; S.signed = null; S.open = {}; S.noAuto = {}; S.seenResolve = false;
-  applyAuto();
+  S.drafts = {}; S.acks = {}; S.signed = null; S.open = {}; S.noAuto = {}; S.toBill = {}; S.seenResolve = false;
+  applyAuto(); applyToBill();
 }
 /* A payout whose amount matches exactly one Xola payout (with a known class) needs no decision: it is confirmed automatically. */
 const NO_HIST = ['C2','C3','D','E','F'];
 function histKey(r){
-  const v = Engine.norm(r.payout ? (r.platform==='Xola' ? '' : r.platform) : (r.qboVendor || r.vendor || '')); if(!v || r.steven || NO_HIST.includes(r.tier)) return '';
+  const v = Engine.norm(r.payout ? (r.platform==='Xola' ? '' : r.platform) : (r.qboVendor || r.vendor || '')); if(r.steven || NO_HIST.includes(r.tier)) return '';
+  if(!v){ if(r.exKind!=='novendor' || !r.desc) return ''; return r.account.num + '|~' + Engine.norm(r.desc).slice(0,60) + '|' + r.amount.toFixed(2); }   // payee not in the bank text: same text + same amount
   return r.account.num + '|' + v + '|' + (r.amount < 0 ? 'out' : 'in');
 }
 function remember(r, res){
@@ -1220,11 +1223,14 @@ function remember(r, res){
   const keys = Object.keys(H); if(keys.length > 400) keys.sort((a,b) => (H[a].at||'').localeCompare(H[b].at||'')).slice(0, keys.length-400).forEach(x => delete H[x]);
   saveAll();
 }
+function applyToBill(){
+  S.results.forEach(r => { if(S.toBill && S.toBill[r.id] && r.lane!=='bill'){ r.lane = 'bill'; r.billStatus = 'amount'; r.resolved = null; r.reason = 'Moved to the Bill Payments list by a team member: the vendor has open bills. Match it to the bill in QuickBooks.'; } });
+}
 function applyAuto(){
   S.noAuto = S.noAuto || {};
   const H = S.cfg.history || {};
   S.results.forEach(r => {
-    if(r.resolved || S.noAuto[r.id] || r.autoConfirm || r.lane!=='new' || !Engine.canConfirm(r)) return;
+    if(r.resolved || S.noAuto[r.id] || r.autoConfirm || !(r.lane==='new' || r.exKind==='novendor') || !Engine.canConfirm(r)) return;
     const h = H[histKey(r)]; if(!h || !h.gl || !h.cls || Engine.isRetiredClass(h.cls) || Engine.isReserved(h.cls)) return;
     r.resolved = {confirmed:true, auto:true, hist:true, vendor:h.vendor, gl:h.gl, cls:h.cls, isNewVendor:false};
   });
@@ -1241,7 +1247,7 @@ function rerun(){
   S.txs = []; S.feeds.forEach(f => { if(f.acctIdx >= 0) S.txs.push(...Engine.loadFeed(f.text, acctFor(f), 'f'+f.id, S.forced)); });
   S.results = Engine.run(S.txs, cfgAll());
   S.results.forEach(r => r.resolved = keep.get(r.id) || null);
-  applyAuto();
+  applyAuto(); applyToBill();
   const proposed = new Set(S.cfg.newVendorLog.filter(v => v.status==='proposed').map(v => Engine.norm(v.vendor)));
   S.results.forEach(r => { if((r.resolved && r.resolved.isNewVendor) || (r.lane!=='scope' && r.lane!=='bill' && proposed.has(Engine.norm(r.qboVendor||r.vendor||'')))) r.newVendor = true; });
   S.signed = null;
@@ -1403,7 +1409,7 @@ function payoutBlock(r, d){
   return `<div class="picks"><span class="lbl">${o.length>1?'Same amount in several locations. Choose:':'Matching payout:'}</span>${chips}</div>`;
 }
 function draftFor(r){
-  if(!S.drafts[r.id]) S.drafts[r.id] = { vendor: r.qboVendor || r.vendor || r.platform || '', gl: r.gl || r.suggestedGL || '', loc: (r.payoutOptions&&r.payoutOptions.length===1) ? r.payoutOptions[0].locs.join(', ') : '', personal: !!(r.payoutOptions&&r.payoutOptions.length===1&&r.payoutOptions[0].personal), cls: (r.cls && !/^run class/i.test(r.cls)) ? r.cls : (r.adminDefault ? (S.cfg.classMap.Administrative || Engine.DEFAULT_CLASS_MAP.Administrative) : r.pickClass ? '' : r.proposedClass) };
+  if(!S.drafts[r.id]) S.drafts[r.id] = { vendor: (r.payout && r.platform) ? r.platform : (r.qboVendor || r.vendor || r.platform || ''), gl: r.gl || r.suggestedGL || '', loc: (r.payoutOptions&&r.payoutOptions.length===1) ? r.payoutOptions[0].locs.join(', ') : '', personal: !!(r.payoutOptions&&r.payoutOptions.length===1&&r.payoutOptions[0].personal), cls: (r.cls && !/^run class/i.test(r.cls)) ? r.cls : (r.adminDefault ? (S.cfg.classMap.Administrative || Engine.DEFAULT_CLASS_MAP.Administrative) : r.pickClass ? '' : r.proposedClass) };
   return S.drafts[r.id];
 }
 function vResolve(){
@@ -1425,12 +1431,13 @@ function vResolve(){
       const sim = (r.suggest||[]).map((s,i) => `<button class="pick" data-pick-vendor="${r.id}" data-i="${i}">${esc(s.vendor)} <span class="sub">tier ${esc(s.tier)}</span></button>`).join('');
       const gls = suggestGl.map((g,i) => `<button class="pick" data-pick-gl="${r.id}" data-g="${esc(g)}">${esc(g)}</button>`).join('');
       body = `${sim?`<div class="picks"><span class="lbl">Existing vendors that may match:</span>${sim}</div>`:''}
+      ${(()=>{ if(r.exKind!=='novendor' || r.amount>=0) return ''; const bl=(S.cfg.openBills||[]).filter(b=>!b.total&&b.amount>0), best={}; bl.forEach(b=>{ const df=Math.abs(b.amount-Math.abs(r.amount)); if(best[b.vendor]==null||df<best[b.vendor]) best[b.vendor]=df; }); const top=Object.entries(best).sort((a,b)=>a[1]-b[1]).slice(0,6); return top.length?`<div class="picks"><span class="lbl">Vendors with open bills (closest amount first):</span>${top.map(([v,df])=>`<button class="pick" data-pick-bill="${r.id}" data-v="${esc(v)}">${esc(v)}${df<0.005?' <span class="sub">exact amount</span>':''}</button>`).join('')}</div>`:''; })()}
       ${r.payout?payoutBlock(r,d):''}
       <div class="two"><label class="f">Vendor (exact QBO name)<input type="text" list="vlist" data-d="${r.id}" data-k="vendor" value="${esc(d.vendor)}"><span class="hint">${r.payout?'':r.account.cur==='GBP'?'Wise GBP vendors end in _G.':r.account.cur==='EUR'?'Euro vendors end in _E.':'Use the name exactly as in QBO.'}</span></label>
       <label class="f">Class${clsSelect(r.id, d.cls, r.steven)}<span class="hint">${r.proposedWhy&&!r.payout?'Proposed from '+esc(r.proposedWhy):''}</span></label></div>
       <label class="f">GL account<div class="glrow"><input type="search" placeholder="Filter accounts" data-filter-gl="${r.id}">${glSelect(r.id, d.gl, suggestGl)}</div></label>
       ${gls?`<div class="picks"><span class="lbl">${r.suggestGls&&r.suggestGls.length?'Accounts this vendor has used:':'QBO suggested:'}</span>${gls}</div>`:''}
-      <div class="row" style="justify-content:flex-end"><button class="btn primary" data-confirm="${r.id}">Confirm</button></div>`;
+      <div class="row" style="justify-content:flex-end">${r.amount<0&&!r.payout?`<button class="btn ghost" data-to-bill="${r.id}">Pay a bill instead</button>`:''}<button class="btn primary" data-confirm="${r.id}">Confirm</button></div>`;
     }
     return `<div class="card rc ${ok?'done':''} ${r.newVendor&&!ok?'isnew':''}" data-card="${r.id}">${head}${r.payout&&!ok?'':`<div class="whybox">${esc(r.reason)}</div>`}${body}</div>`;
   }).join('');
@@ -1940,6 +1947,14 @@ function weeklyNote(){
 }
 
 /* ---------- events ---------- */
+function fillFromMaster(card, dr, name){
+  const m = S.master.find(x => Engine.norm(x.vendor)===Engine.norm(name)); if(!m) return false;
+  let did = false;
+  const setSel = (k, v) => { const sel = card.querySelector('[data-k='+k+']'); if(!sel) return; if(![...sel.options].some(o => o.value===v)){ const o = document.createElement('option'); o.value = v; o.textContent = v; sel.appendChild(o); } sel.value = v; dr[k] = v; did = true; };
+  if(m.gl && m.gl!=='UNCLEAR' && !/\(per invoice\)|\(liability\)/i.test(m.gl)) setSel('gl', m.gl);
+  if(m.cls && !/^run class|^n\/a|^bifurcate/i.test(m.cls)) setSel('cls', Engine.remapClass(m.cls));
+  return did;
+}
 function confirmRow(id){
   const r = S.results.find(x => x.id===id), dr = S.drafts[id];
   if(r.payout && dr.personal){ r.resolved = {confirmed:true, personal:true, loc:dr.loc, vendor:dr.vendor||r.platform, gl:'Steven personal book', cls:'', by:S.member.trim()||'', isNewVendor:false}; S.signed = null; render(); return toast('Confirmed. This payout belongs to Steven\'s personal book and is on the Steven personal list, not the Empire import.'); }
@@ -1951,7 +1966,7 @@ function confirmRow(id){
   if(!r.payout && !r.steven && !S.mHeader.length && !S.master.some(m => Engine.norm(m.vendor)===Engine.norm(vend))) return toast('Load the Vendor Master first, so a new vendor can be added to it.');
   const isNew = !r.payout && !r.steven && !S.master.some(m => Engine.norm(m.vendor)===Engine.norm(vend));
   r.resolved = {confirmed:true, vendor:vend, gl:dr.gl.trim(), cls:dr.cls.trim(), by:S.member.trim()||'', isNewVendor:isNew, loc:r.payout?dr.loc:''};
-  remember(r, r.resolved);
+  remember(r, r.resolved); applyAuto();
   let extra = 0;
   if(isNew){
     const ix = Engine.masterIndex([S.mHeader]); const raw = new Array(S.mHeader.length).fill('');
@@ -1972,7 +1987,7 @@ function confirmRow(id){
 }
 
 document.addEventListener('click', async e => {
-  const t = e.target.closest('[data-view],[data-filter],[data-open],[data-confirm],[data-undo],[data-add],[data-del],[data-dtab],[data-export],[data-save-list],[data-force],[data-goto-data],[data-pick-vendor],[data-pick-opt],[data-toggle-auto],[data-pick-gl],[data-clear],[data-nobills],[data-feed-del],button');
+  const t = e.target.closest('[data-view],[data-filter],[data-open],[data-confirm],[data-undo],[data-add],[data-del],[data-dtab],[data-export],[data-save-list],[data-force],[data-goto-data],[data-pick-vendor],[data-pick-opt],[data-pick-bill],[data-to-bill],[data-toggle-auto],[data-pick-gl],[data-clear],[data-nobills],[data-feed-del],button');
   if(!t) return;
   const d = t.dataset;
   if(d.view) return go(d.view);
@@ -1999,6 +2014,8 @@ document.addEventListener('click', async e => {
     if(s.cls && !/^run class|^n\/a|^bifurcate/i.test(s.cls)){ dr.cls = Engine.remapClass(s.cls); const sel = card.querySelector('[data-k=cls]'); if(![...sel.options].some(o => o.value===s.cls)){ const o = document.createElement('option'); o.value = s.cls; o.textContent = s.cls; sel.appendChild(o); } sel.value = s.cls; }
     return toast('Filled from the existing vendor. Check it before you confirm.');
   }
+  if(d.pickBill){ const r = S.results.find(x => x.id===d.pickBill), dr = S.drafts[r.id], card = t.closest('.rc'); dr.vendor = d.v; card.querySelector('[data-k=vendor]').value = d.v; fillFromMaster(card, dr, d.v); return toast('Vendor set. This vendor has an open bill. If this pays it, use "Pay a bill instead".'); }
+  if(d.toBill){ const r = S.results.find(x => x.id===d.toBill); (S.toBill = S.toBill || {})[r.id] = true; applyToBill(); S.signed = null; render(); return toast('Moved to the Bill Payments list. Match it in QuickBooks.'); }
   if(d.pickGl){ const dr = S.drafts[d.pickGl], card = t.closest('.rc'), sel = card.querySelector('[data-k=gl]'); dr.gl = d.g; if(![...sel.options].some(o => o.value===d.g)){ const o = document.createElement('option'); o.value = d.g; o.textContent = d.g; sel.appendChild(o); } sel.value = d.g; return; }
   if(t.id==='dataBtn') return go('data');
   if(t.id==='sopBtn') return go('sop');
@@ -2021,6 +2038,7 @@ document.addEventListener('input', e => {
 });
 document.addEventListener('change', async e => {
   const t = e.target, d = t.dataset;
+  if(d.d && t.tagName==='INPUT' && d.k==='vendor'){ S.drafts[d.d].vendor = t.value; if(fillFromMaster(t.closest('.rc'), S.drafts[d.d], t.value.trim())) toast('Account and class filled from the Vendor Master. Check them.'); return; }
   if(d.d && t.tagName==='SELECT'){ S.drafts[d.d][d.k] = t.value; if(d.k==='cls') S.drafts[d.d].personal = false; return; }
   if(d.ack!==undefined){ S.acks[d.ack] = t.checked; S.signed = null; return render(); }
   if(d.feedAcct){ const f = S.feeds.find(x => String(x.id)===d.feedAcct); f.acctIdx = +t.value; if(f.acctIdx >= 0) f.count = Engine.loadFeed(f.text, acctFor(f), 'x').length; return render(); }
